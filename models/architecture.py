@@ -88,7 +88,7 @@ class TrainHybridModel(nn.Module):
                     img_size=128,     
                     patch_size=1, in_chans=1, 
                     embed_dim=96, 
-                    depths=[8, 8, 8, 8], 
+                    depths=[6, 6, 6, 6], 
                     num_heads=[6, 6, 6, 6], 
                     window_size=8, 
                     compress_ratio=3, squeeze_factor=30, conv_scale=0.01, 
