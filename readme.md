@@ -1,5 +1,7 @@
 # Guida alla Configurazione del Progetto SuperResolution
-
+apt update
+apt install unzip
+pip install tensorboard
 ## 1. Configurazione dell'Ambiente Virtuale (Venv)
 
 È fondamentale utilizzare un ambiente virtuale per isolare le dipendenze del progetto.
@@ -31,3 +33,5 @@ pip install -r requirements.txt
 o
 pip install --no-cache-dir -r requirements.txt
 ```
+tensorboard --logdir=outputs --port=6007 --bind_all
+
