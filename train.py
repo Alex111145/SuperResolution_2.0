@@ -42,8 +42,8 @@ ACCUM_STEPS = 4
 LR_G = 1e-4           
 LR_D = 1e-4           
 TOTAL_EPOCHS = 300 
-LOG_INTERVAL = 5    
-IMAGE_INTERVAL = 10
+LOG_INTERVAL = 1 
+IMAGE_INTERVAL = 1
 
 def setup():
     """Inizializza il gruppo di processi per DDP"""
