@@ -61,6 +61,11 @@ wget -O ~/SuperResolution/models/HAT.zip https://github.com/Alex111145/SuperReso
 # Scarica Real-ESRGAN
 wget -O ~/SuperResolution/models/Real-ESRGAN.zip https://github.com/Alex111145/SuperResolution/raw/main/models/Real-ESRGAN.zip
 
+o 
+
+
+wget -O /workspace/SuperResolution/models/HAT.zip https://github.com/Alex111145/SuperResolution/raw/main/models/HAT.zip
+
 # Scarica BasicSR
 wget -O ~/SuperResolution/models/BasicSR.zip https://github.com/Alex111145/SuperResolution/raw/main/models/BasicSR.zip
 
