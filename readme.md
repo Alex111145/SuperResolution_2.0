@@ -80,3 +80,40 @@ unzip BasicSR.zip
 # Unzip dei dati
 cd ~/SuperResolution
 unzip data.zip
+
+
+
+
+L'errore conferma che sul tuo PC (utente "dell") non è ancora stata creata nessuna chiave SSH. Non preoccuparti, è normalissimo se non l'hai mai fatto prima.
+
+Ecco i passaggi per crearla in 10 secondi direttamente da quella finestra di PowerShell:
+
+1. Genera la chiave
+Copia e incolla questo comando e premi Invio:
+
+PowerShell
+
+ssh-keygen -t rsa -b 4096
+2. Rispondi alle domande (Premi sempre Invio)
+Il terminale ti farà tre domande. Non scrivere nulla, premi solo il tasto Invio per ognuna:
+
+Enter file in which to save the key... → Premi Invio (conferma il percorso predefinito).
+
+Enter passphrase... → Premi Invio (lascia vuoto per non dover inserire una password ogni volta).
+
+Enter same passphrase again... → Premi Invio.
+
+3. Visualizza la chiave creata
+Ora che la chiave esiste, usa lo stesso comando di prima per vederla:
+
+PowerShell
+
+cat ~/.ssh/id_rsa.pub
+4. Copia e incolla su Vast.ai
+Vedrai una stringa che inizia con ssh-rsa e finisce con dell@NOME-PC.
+
+Seleziona tutto il testo (assicurati di prendere tutta la riga, dall'inizio alla fine).
+
+Fai click destro per copiare (o Ctrl+C).
+
+Vai su Vast.ai -> Account -> SSH Key e incollala lì.
