@@ -10,8 +10,10 @@ from PIL import Image
 from tqdm import tqdm
 from typing import List, Optional, Dict
 
+# --- CORREZIONE PATH ---
+# Lo script è nella root del progetto, quindi il parent è la root stessa.
 CURRENT_SCRIPT = Path(__file__).resolve()
-PROJECT_ROOT = CURRENT_SCRIPT.parent.parent
+PROJECT_ROOT = CURRENT_SCRIPT.parent
 OUTPUT_ROOT = PROJECT_ROOT / "outputs"
 ROOT_DATA_DIR = PROJECT_ROOT / "data"
 
@@ -21,18 +23,22 @@ if str(PROJECT_ROOT) not in sys.path:
 print(f"PATH INFO:")
 print(f"Project Root: {PROJECT_ROOT}")
 
-if not (PROJECT_ROOT / "src").exists():
-    sys.exit("ERRORE CRITICO: Cartella 'src' non trovata nella root.")
+# --- RIMOSSO CONTROLLO 'src' ---
+# La nuova struttura usa 'models', 'dataset', 'utils'
 
 print("Importazione moduli...")
 
 try:
-    from src.architecture_train import TrainHybridModel
-    from src.dataset import AstronomicalDataset
-    from src.metrics_train import TrainMetrics
+    # --- CORREZIONE IMPORT ---
+    # Adattati alla nuova struttura del progetto
+    from models.architecture import TrainHybridModel
+    from dataset.astronomical_dataset import AstronomicalDataset
+    from utils.metrics import TrainMetrics
     print("Moduli importati correttamente.")
 except ImportError as e:
     print(f"\nERRORE IMPORTAZIONE MODULI PROGETTO (Controlla sys.path e dipendenze): {e}")
+    # Suggerimento debug per l'utente
+    print(f"Assicurati che esistano le cartelle: {PROJECT_ROOT}/models, {PROJECT_ROOT}/dataset, {PROJECT_ROOT}/utils")
     sys.exit(1)
 
 torch.backends.cudnn.benchmark = True
@@ -180,7 +186,7 @@ def run_test(target_model_folder: str):
     data_target_names = get_target_list_from_model_name(target_model_folder)
     target_base_name = target_model_folder.replace("_DDP_GAN", "").replace("_DDP", "")
     
-    # MODIFICA: Cerca SOLO pesi GAN (Best o Latest/Resume)
+    # Cerca SOLO pesi GAN (Best o Latest/Resume)
     checkpoints = list(CHECKPOINT_DIR.glob("best_gan_model.pth"))
     ckpt_type = "GAN (Best)"
         
@@ -188,8 +194,6 @@ def run_test(target_model_folder: str):
         # Se non c'è il best, proviamo il latest (che contiene i pesi GAN del training corrente)
         checkpoints = list(CHECKPOINT_DIR.glob("latest_checkpoint.pth"))
         ckpt_type = "Latest (GAN Resume)"
-    
-    # MODIFICA: Rimossa ricerca "best_train_model.pth" e "*.pth"
     
     if not checkpoints:
         print(f"Nessun checkpoint GAN trovato in {CHECKPOINT_DIR}")
@@ -223,7 +227,15 @@ def run_test(target_model_folder: str):
     try:
         state_dict = torch.load(CHECKPOINT_PATH, map_location=device)
         new_state_dict = {}
-        for k, v in state_dict.items():
+        
+        # Gestione del dizionario salvato vs state_dict diretto
+        source_state = state_dict
+        if 'net_g' in state_dict:
+            source_state = state_dict['net_g']
+        elif 'model_state_dict' in state_dict:
+            source_state = state_dict['model_state_dict']
+            
+        for k, v in source_state.items():
             name = k.replace("module.", "") if k.startswith("module.") else k
             new_state_dict[name] = v
         
