@@ -41,8 +41,8 @@ BATCH_SIZE = 1
 ACCUM_STEPS = 4       
 LR_G = 1e-4           
 LR_D = 1e-4           
-TOTAL_EPOCHS = 300 
-LOG_INTERVAL = 1 
+TOTAL_EPOCHS = 400 
+LOG_INTERVAL = 1   
 IMAGE_INTERVAL = 1
 
 def setup():
