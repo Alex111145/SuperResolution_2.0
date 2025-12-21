@@ -16,22 +16,26 @@ import warnings
 import time
 from copy import deepcopy
 
+# Ignora warning meno importanti
 warnings.filterwarnings("ignore")
 
+# Percorsi base
 CURRENT_SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_SCRIPT_DIR
 ROOT_DATA_DIR = PROJECT_ROOT / "data"
 sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
+    # Import corretti (SENZA cartella basicsr)
     from models.architecture import SwinIR 
     from models.discriminator import UNetDiscriminatorSN
     from dataset.astronomical_dataset import AstronomicalDataset
     from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
     from utils.metrics import TrainMetrics
 except ImportError as e:
-    sys.exit(f"Errore Import: {e}. Verifica la struttura delle cartelle.")
+    sys.exit(f"Errore Import: {e}. Verifica che models/architecture.py esista e non sia in sottocartelle errate.")
 
+# Iperparametri
 BATCH_SIZE = 2          
 ACCUM_STEPS = 4         
 LR_G = 1e-4             
@@ -42,6 +46,7 @@ IMAGE_INTERVAL = 1
 EMA_DECAY = 0.999        
 
 class ModelEMA:
+    """Exponential Moving Average per pesi più stabili."""
     def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
@@ -100,6 +105,7 @@ def train_worker():
     target_names = [t.strip() for t in args.target.split(',') if t.strip()]
     target_output_name = "_".join(target_names)
 
+    # Definizione cartelle output
     out_dir = PROJECT_ROOT / "outputs" / f"{target_output_name}_DDP_SwinIR"
     save_dir = out_dir / "checkpoints"
     img_dir = out_dir / "images"
@@ -107,7 +113,6 @@ def train_worker():
     splits_dir_temp = out_dir / "temp_splits"
 
     latest_ckpt_path = save_dir / "latest_checkpoint.pth"
-    best_weights_path = save_dir / "best_gan_model.pth"
 
     if is_master:
         for d in [save_dir, img_dir, log_dir, splits_dir_temp]: d.mkdir(parents=True, exist_ok=True)
@@ -116,6 +121,7 @@ def train_worker():
 
     dist.barrier() 
 
+    # Caricamento e unione dei JSON dataset
     all_train_data = []
     all_val_data = []
     for t_name in target_names:
@@ -126,11 +132,13 @@ def train_worker():
         except FileNotFoundError:
             if is_master: print(f"Dati non trovati per {t_name}, salto.")
 
+    # Salvataggio JSON temporanei per DDP
     ft_path = splits_dir_temp / f"temp_train_r{rank}.json"
     fv_path = splits_dir_temp / f"temp_val_r{rank}.json"
     with open(ft_path, 'w') as f: json.dump(all_train_data, f)
     with open(fv_path, 'w') as f: json.dump(all_val_data, f)
 
+    # Dataset e DataLoader
     train_ds = AstronomicalDataset(ft_path, base_path=PROJECT_ROOT, augment=True)
     val_ds = AstronomicalDataset(fv_path, base_path=PROJECT_ROOT, augment=False)
     
@@ -140,6 +148,7 @@ def train_worker():
     val_sampler = DistributedSampler(val_ds, shuffle=False)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2, sampler=val_sampler)
 
+    # --- MODELLO GENERATORE (SwinIR) ---
     net_g = SwinIR(upscale=4, in_chans=1, img_size=128, window_size=8,
                    img_range=1.0, depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
                    mlp_ratio=2, upsampler='pixelshuffle', resi_connection='1conv')
@@ -147,19 +156,31 @@ def train_worker():
     net_g = net_g.to(device)
     net_g = DDP(net_g, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
+    # --- MODELLO DISCRIMINATORE ---
     net_d = UNetDiscriminatorSN(num_in_ch=1, num_feat=64).to(device)
     net_d = nn.SyncBatchNorm.convert_sync_batchnorm(net_d)
     net_d = DDP(net_d, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     ema_g = ModelEMA(net_g.module, decay=EMA_DECAY)
 
+    # Ottimizzatori
     opt_g = optim.AdamW(net_g.parameters(), lr=LR_G, weight_decay=0, betas=(0.9, 0.99))
     opt_d = optim.AdamW(net_d.parameters(), lr=LR_D, weight_decay=0, betas=(0.9, 0.99))
 
     sched_g = optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=TOTAL_EPOCHS, eta_min=1e-7)
     sched_d = optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=TOTAL_EPOCHS, eta_min=1e-7)
 
-    criterion_g = CombinedGANLoss(gan_type='ragan', pixel_weight=1.0, perceptual_weight=0.5, adversarial_weight=0.005).to(device)
+    # --- LOSSES AGGIORNATE PER STELLE DEBOLI ---
+    # Qui attiviamo HighFrequencyLoss (hf_weight) e LogLoss (log_weight)
+    criterion_g = CombinedGANLoss(
+        gan_type='ragan', 
+        pixel_weight=1.0, 
+        perceptual_weight=0.5, 
+        adversarial_weight=0.005,
+        hf_weight=1.0,    # IMPORTANTE: Forza il recupero delle stelle puntiformi
+        log_weight=0.5    # IMPORTANTE: Amplifica l'errore sulle zone scure
+    ).to(device)
+    
     criterion_d = DiscriminatorLoss(gan_type='ragan').to(device)
     
     scaler = torch.cuda.amp.GradScaler() 
@@ -168,6 +189,7 @@ def train_worker():
     best_psnr = 0.0
     map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
     
+    # Resume training
     if latest_ckpt_path.exists():
         try:
             checkpoint = torch.load(latest_ckpt_path, map_location=map_location)
@@ -182,6 +204,7 @@ def train_worker():
         except Exception as e:
             if is_master: print(f"Errore resume: {e}")
 
+    # Loop di Training
     for epoch in range(start_epoch, TOTAL_EPOCHS + 1):
         start_time = time.time()
         train_sampler.set_epoch(epoch)
@@ -201,6 +224,7 @@ def train_worker():
             lr_img = batch['lr'].to(device, non_blocking=True)
             hr_img = batch['hr'].to(device, non_blocking=True)
             
+            # --- UPDATE DISCRIMINATOR ---
             for p in net_d.parameters(): p.requires_grad = True
             for p in net_g.parameters(): p.requires_grad = False
             
@@ -224,6 +248,7 @@ def train_worker():
                 scaler.step(opt_d)
                 opt_d.zero_grad()
 
+            # --- UPDATE GENERATOR ---
             for p in net_d.parameters(): p.requires_grad = False
             for p in net_g.parameters(): p.requires_grad = True
             
@@ -255,6 +280,7 @@ def train_worker():
         sched_g.step()
         sched_d.step()
         
+        # Logging e Validazione
         if epoch % LOG_INTERVAL == 0:
             metrics = torch.tensor([accum_g, accum_d, valid_batches], device=device)
             dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
@@ -268,6 +294,7 @@ def train_worker():
             net_g.eval()
             local_metrics = TrainMetrics()
             
+            # Validation Loop
             with torch.inference_mode():
                 for v_batch in val_loader:
                     v_lr = v_batch['lr'].to(device)
@@ -287,18 +314,20 @@ def train_worker():
             dist.all_reduce(t_ssim, op=dist.ReduceOp.SUM)
             
             g_psnr = t_psnr.item() / t_cnt.item() if t_cnt.item() > 0 else 0
-            g_ssim = t_ssim.item() / t_cnt.item() if t_cnt.item() > 0 else 0
+            # g_ssim = t_ssim.item() / t_cnt.item() if t_cnt.item() > 0 else 0
 
             if is_master:
                 print(f" Ep {epoch:04d} | G: {avg_g:.4f} | D: {avg_d:.4f} | PSNR: {g_psnr:.2f} | Time: {time.time()-start_time:.0f}s")
                 writer.add_scalar('Metrics/PSNR', g_psnr, epoch)
                 
+                # Salvataggio miglior modello
                 if g_psnr > best_psnr:
                     best_psnr = g_psnr
                     ema_g.apply_shadow()
                     torch.save(net_g.module.state_dict(), save_dir / "best_gan_model.pth")
                     ema_g.restore()
                 
+                # Salvataggio checkpoint standard
                 checkpoint_dict = {
                     'epoch': epoch,
                     'net_g': net_g.module.state_dict(),
@@ -310,9 +339,11 @@ def train_worker():
                 }
                 torch.save(checkpoint_dict, latest_ckpt_path)
 
+                # Salvataggio immagini preview
                 if epoch % IMAGE_INTERVAL == 0:
                     with torch.no_grad():
                         ema_g.apply_shadow()
+                        # Usa l'ultimo batch di validazione rimasto in memoria (v_lr)
                         v_pred_vis = net_g(v_lr).float().clamp(0, 1)
                         ema_g.restore()
                         v_lr_up = torch.nn.functional.interpolate(v_lr, size=v_pred_vis.shape[2:], mode='nearest')
