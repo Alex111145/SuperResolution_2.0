@@ -39,7 +39,7 @@ def get_image_data(hdul):
     return hdul[0].data, hdul[0].header
 
 def load_observatory_master(folder_path):
-    """Carica l'immagine dell'osservatorio per usarla come 'Tela Master'."""
+
     files = sorted(list(folder_path.glob('*.fits')) + list(folder_path.glob('*.fit')))
     if not files: return None, None, None
     
@@ -65,9 +65,7 @@ def load_observatory_master(folder_path):
     return master_data, ref_wcs
 
 def create_hubble_mosaic(folder_path, target_wcs, target_shape):
-    """
-    Invece di stackare, PROIETTA ogni pezzo di Hubble sulla griglia dell'Osservatorio.
-    """
+
     files = sorted(list(folder_path.glob('*.fits')) + list(folder_path.glob('*.fit')))
     if not files: return None
 
