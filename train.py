@@ -32,7 +32,7 @@ try:
 except ImportError as e:
     sys.exit(f"Errore Import: {e}. Verifica la struttura delle cartelle.")
 
-BATCH_SIZE = 1          
+BATCH_SIZE = 2          
 ACCUM_STEPS = 4         
 LR_G = 1e-4             
 LR_D = 1e-4             
