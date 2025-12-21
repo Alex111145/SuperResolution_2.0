@@ -4,19 +4,15 @@ import subprocess
 import torch
 from pathlib import Path
 
-# --- MODIFICA PATH: Nuova Struttura ---
 CURRENT_SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_SCRIPT_DIR
 DATA_DIR = PROJECT_ROOT / "data"
-# train.py è ora nella stessa cartella (root)
 SCRIPT_PATH = PROJECT_ROOT / "train.py"
 
 def clear_screen():
-    """Pulisce la console."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def get_available_targets(required_subdir='8_dataset_split'):
-    """Trova le directory target che hanno gli split JSON pronti."""
     if not DATA_DIR.exists():
         return []
     
@@ -29,7 +25,6 @@ def get_available_targets(required_subdir='8_dataset_split'):
     return sorted(valid_subdirs)
 
 def get_available_gpus():
-    """Restituisce una lista delle GPU disponibili con dettagli."""
     count = torch.cuda.device_count()
     gpus = []
     for i in range(count):
@@ -39,7 +34,6 @@ def get_available_gpus():
     return gpus
 
 def select_targets_interactive(targets):
-    """Permette la selezione interattiva di uno o più target."""
     print("Target disponibili per il training (con split pronti):")
     for idx, t in enumerate(targets):
         print(f"   [{idx}] {t}")
@@ -71,7 +65,6 @@ def select_targets_interactive(targets):
             print("Formato di input non valido.")
 
 def select_gpus_interactive(gpus):
-    """Permette la selezione interattiva delle GPU."""
     print("GPU Disponibili:")
     for g in gpus:
         print(f"   {g}")
@@ -102,7 +95,7 @@ def select_gpus_interactive(gpus):
 def main():
     clear_screen()
     print("==========================================")
-    print(" 	      SUPER RESOLUTION LAUNCHER      ")
+    print("          SUPER RESOLUTION LAUNCHER      ")
     print("==========================================\n")
 
     if not torch.cuda.is_available():
