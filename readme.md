@@ -1,16 +1,5 @@
-NOVITA: ha solo il batch size 2 rispetto a 1 di 0.0
+Smart Upscale (PixelShuffle): Ho inserito la classe Upsample che utilizza nn.PixelShuffle. A differenza del ridimensionamento standard, questo modulo utilizza i canali per ricostruire spazialmente l'immagine, eliminando l'effetto sfocato dell'interpolazione.
 
+Fix Crash Dimensionale: All'interno di SwinTransformerBlock, il sistema ora verifica se la risoluzione dell'input è inferiore alla window_size. In tal caso, riduce dinamicamente la finestra per evitare errori di calcolo.
 
-
-python -m venv venv
-
-source venv/bin/activate
-
-pip install -r requirements.txt
-
-
-pip install --no-cache-dir -r requirements.txt
-python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
-
-
-pkill -9 python
+Gestione Dinamica (F.pad): Nel metodo forward di SwinIR, l'immagine viene automaticamente "paddata" (completata) per essere divisibile per la dimensione della finestra, prevenendo i tipici RuntimeError durante il partizionamento.
