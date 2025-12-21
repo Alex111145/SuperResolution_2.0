@@ -52,12 +52,6 @@ def run_test(target_model_folder: str):
     CHECKPOINT_PATH = checkpoints[0]
     print(f"Loading: {CHECKPOINT_PATH}")
 
-    # Aggregazione finta per esempio (adattare come nell'originale)
-    # Qui assumiamo che l'utente abbia i file JSON corretti o modifichiamo per test manuale
-    # Per semplicità, richiedo la selezione manuale o uso un target fittizio se non trovo JSON
-    # (Inserire qui la logica 'aggregate_test_data' originale se necessaria)
-
-    # --- MODEL INIT ---
     model = SwinIR(upscale=4, in_chans=1, img_size=128, window_size=8,
                    img_range=1.0, depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
                    mlp_ratio=2, upsampler='pixelshuffle', resi_connection='1conv').to(device)
@@ -80,13 +74,7 @@ def run_test(target_model_folder: str):
 
     model.eval()
     
-    # Esempio caricamento dati (qui dovresti usare il tuo aggregate_test_data)
-    # Per ora uso un placeholder
     print("Script inferenza pronto. Assicurati di passare un JSON valido a AstronomicalDataset.")
-    # test_ds = AstronomicalDataset(temp_json_path, base_path=PROJECT_ROOT, augment=False)
-    # test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
-    
-    # ... loop inferenza ...
 
 if __name__ == "__main__":
     targets = get_available_targets(OUTPUT_ROOT)
