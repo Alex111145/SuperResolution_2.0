@@ -18,7 +18,6 @@ from copy import deepcopy
 
 warnings.filterwarnings("ignore")
 
-# --- PATH SETUP ---
 CURRENT_SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_SCRIPT_DIR
 ROOT_DATA_DIR = PROJECT_ROOT / "data"
@@ -33,19 +32,16 @@ try:
 except ImportError as e:
     sys.exit(f"Errore Import: {e}. Verifica la struttura delle cartelle.")
 
-# --- CONFIGURAZIONE ---
 BATCH_SIZE = 1          
 ACCUM_STEPS = 4         
-LR_G = 1e-4             # LR tipico per SwinIR
+LR_G = 1e-4             
 LR_D = 1e-4             
 TOTAL_EPOCHS = 300 
 LOG_INTERVAL = 1   
-IMAGE_INTERVAL = 1      
-EMA_DECAY = 0.999       
+IMAGE_INTERVAL = 1       
+EMA_DECAY = 0.999        
 
-# --- UTILS ---
 class ModelEMA:
-    """ Exponential Moving Average per i pesi del Generatore """
     def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
@@ -88,7 +84,6 @@ def setup():
 def cleanup():
     dist.destroy_process_group()
 
-# --- TRAINING LOOP ---
 def train_worker():
     setup()
     
@@ -105,14 +100,12 @@ def train_worker():
     target_names = [t.strip() for t in args.target.split(',') if t.strip()]
     target_output_name = "_".join(target_names)
 
-    # Paths
     out_dir = PROJECT_ROOT / "outputs" / f"{target_output_name}_DDP_SwinIR"
     save_dir = out_dir / "checkpoints"
     img_dir = out_dir / "images"
     log_dir = out_dir / "tensorboard"
     splits_dir_temp = out_dir / "temp_splits"
 
-    # Load paths
     latest_ckpt_path = save_dir / "latest_checkpoint.pth"
     best_weights_path = save_dir / "best_gan_model.pth"
 
@@ -123,7 +116,6 @@ def train_worker():
 
     dist.barrier() 
 
-    # --- DATASET PREP ---
     all_train_data = []
     all_val_data = []
     for t_name in target_names:
@@ -148,10 +140,6 @@ def train_worker():
     val_sampler = DistributedSampler(val_ds, shuffle=False)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2, sampler=val_sampler)
 
-    # --- MODELS ---
-    # Configurazione SwinIR Light/Medium (per stare in memoria con training GAN)
-    # Upscale=4 fisso per Dataset Astronomico (128 -> 512)
-    # in_chans=1 per immagini B/N
     net_g = SwinIR(upscale=4, in_chans=1, img_size=128, window_size=8,
                    img_range=1.0, depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
                    mlp_ratio=2, upsampler='pixelshuffle', resi_connection='1conv')
@@ -159,27 +147,23 @@ def train_worker():
     net_g = net_g.to(device)
     net_g = DDP(net_g, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
-    # Discriminatore Standard UNet (invariato)
     net_d = UNetDiscriminatorSN(num_in_ch=1, num_feat=64).to(device)
     net_d = nn.SyncBatchNorm.convert_sync_batchnorm(net_d)
     net_d = DDP(net_d, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     ema_g = ModelEMA(net_g.module, decay=EMA_DECAY)
 
-    # Optimizers
     opt_g = optim.AdamW(net_g.parameters(), lr=LR_G, weight_decay=0, betas=(0.9, 0.99))
     opt_d = optim.AdamW(net_d.parameters(), lr=LR_D, weight_decay=0, betas=(0.9, 0.99))
 
     sched_g = optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=TOTAL_EPOCHS, eta_min=1e-7)
     sched_d = optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=TOTAL_EPOCHS, eta_min=1e-7)
 
-    # Losses
     criterion_g = CombinedGANLoss(gan_type='ragan', pixel_weight=1.0, perceptual_weight=0.5, adversarial_weight=0.005).to(device)
     criterion_d = DiscriminatorLoss(gan_type='ragan').to(device)
     
     scaler = torch.cuda.amp.GradScaler() 
 
-    # --- RESUME ---
     start_epoch = 1
     best_psnr = 0.0
     map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
@@ -198,7 +182,6 @@ def train_worker():
         except Exception as e:
             if is_master: print(f"Errore resume: {e}")
 
-    # --- LOOP ---
     for epoch in range(start_epoch, TOTAL_EPOCHS + 1):
         start_time = time.time()
         train_sampler.set_epoch(epoch)
@@ -218,7 +201,6 @@ def train_worker():
             lr_img = batch['lr'].to(device, non_blocking=True)
             hr_img = batch['hr'].to(device, non_blocking=True)
             
-            # 1. Update Discriminator
             for p in net_d.parameters(): p.requires_grad = True
             for p in net_g.parameters(): p.requires_grad = False
             
@@ -242,7 +224,6 @@ def train_worker():
                 scaler.step(opt_d)
                 opt_d.zero_grad()
 
-            # 2. Update Generator (SwinIR)
             for p in net_d.parameters(): p.requires_grad = False
             for p in net_g.parameters(): p.requires_grad = True
             
@@ -274,9 +255,7 @@ def train_worker():
         sched_g.step()
         sched_d.step()
         
-        # --- VALIDATION ---
         if epoch % LOG_INTERVAL == 0:
-            # Reduce metrics
             metrics = torch.tensor([accum_g, accum_d, valid_batches], device=device)
             dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
             
@@ -300,7 +279,6 @@ def train_worker():
             
             ema_g.restore()
             
-            # Reduce Validation Metrics
             t_psnr = torch.tensor(local_metrics.psnr, device=device)
             t_ssim = torch.tensor(local_metrics.ssim, device=device)
             t_cnt = torch.tensor(local_metrics.count, device=device)
@@ -321,7 +299,6 @@ def train_worker():
                     torch.save(net_g.module.state_dict(), save_dir / "best_gan_model.pth")
                     ema_g.restore()
                 
-                # Checkpoint
                 checkpoint_dict = {
                     'epoch': epoch,
                     'net_g': net_g.module.state_dict(),
