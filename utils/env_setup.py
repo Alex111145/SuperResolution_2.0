@@ -3,13 +3,12 @@ import os
 from pathlib import Path
 
 def setup_paths():
-    # Il file si trova in 'utils/', quindi risaliamo alla root del progetto
+ 
     UTILS_DIR = Path(__file__).resolve().parent
     PROJECT_ROOT = UTILS_DIR.parent
     MODELS_DIR = PROJECT_ROOT / "models"
     
-    # Rimosso HAT poiché il progetto utilizza SwinIR come architettura principale
-    # BasicSR viene mantenuto in quanto fornisce classi base e utility necessarie
+
     paths_to_add = [
         MODELS_DIR / "BasicSR"
     ]
@@ -23,7 +22,7 @@ def setup_paths():
                 sys.path.insert(0, str_p)
                 print(f"Aggiunto al path: {p.name}")
         else:
-            # Segnala la mancanza di BasicSR, essenziale per alcune utility di training
+            
             print(f"ATTENZIONE: Percorso necessario non trovato: {p}")
 
 setup_paths()
@@ -34,7 +33,7 @@ def import_external_archs():
     
     RRDBNet = None
     
-    # Importiamo RRDBNet da BasicSR (usato spesso come baseline o blocco ausiliario)
+   
     try:
         from basicsr.archs.rrdbnet_arch import RRDBNet
         print("BasicSR (RRDBNet) importato correttamente.")
