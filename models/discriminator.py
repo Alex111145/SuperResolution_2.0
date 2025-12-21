@@ -4,14 +4,9 @@ from torch.nn import functional as F
 from torch.nn.utils import spectral_norm
 
 class UNetConv2(nn.Module):
-    """
-    Blocco di convoluzione standard per la U-Net.
-    MODIFICA: Rimossa InstanceNorm per preservare range dinamico (ESRGAN style).
-    """
     def __init__(self, in_size, out_size, dropout=0.0):
         super(UNetConv2, self).__init__()
         layers = []
-        # Spectral Norm stabilizza senza alterare la statistica dell'immagine
         layers.append(spectral_norm(nn.Conv2d(in_size, out_size, 4, 2, 1, bias=False)))
         layers.append(nn.LeakyReLU(0.2, inplace=True))
         
@@ -24,15 +19,11 @@ class UNetConv2(nn.Module):
         return self.model(x)
 
 class UNetUpBlock(nn.Module):
-    """
-    Blocco di Upsampling per la parte Decoder.
-    MODIFICA: Rimossa InstanceNorm.
-    """
     def __init__(self, in_size, out_size, dropout=0.0):
         super(UNetUpBlock, self).__init__()
         layers = []
         layers.append(spectral_norm(nn.ConvTranspose2d(in_size, out_size, 4, 2, 1, bias=False)))
-        layers.append(nn.LeakyReLU(0.2, inplace=True)) # Meglio Leaky anche qui
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
         
         if dropout > 0:
             layers.append(nn.Dropout(dropout))
@@ -42,7 +33,6 @@ class UNetUpBlock(nn.Module):
     def forward(self, x, skip_input):
         x = self.model(x)
         
-        # Gestione differenze di dimensione dovute a padding
         if x.size(2) != skip_input.size(2) or x.size(3) != skip_input.size(3):
             x = F.interpolate(x, size=(skip_input.size(2), skip_input.size(3)), 
                               mode='bilinear', align_corners=True)
@@ -51,15 +41,10 @@ class UNetUpBlock(nn.Module):
         return out
 
 class UNetDiscriminatorSN(nn.Module):
-    """
-    Discriminatore U-Net con Spectral Normalization e SENZA Batch/Instance Norm.
-    Più sensibile ai dettagli fini e alla luminosità assoluta.
-    """
     def __init__(self, num_in_ch=1, num_feat=64, skip_connection=True):
         super(UNetDiscriminatorSN, self).__init__()
         self.skip_connection = skip_connection
 
-        # Primo layer (non riduce spazialmente subito se vogliamo dettagli, ma qui manteniamo struttura U-Net)
         self.conv0 = nn.Sequential(
             spectral_norm(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
@@ -67,24 +52,20 @@ class UNetDiscriminatorSN(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # Encoder
         self.conv1 = UNetConv2(num_feat, num_feat * 2)
         self.conv2 = UNetConv2(num_feat * 2, num_feat * 4)
         self.conv3 = UNetConv2(num_feat * 4, num_feat * 8)
         self.conv4 = UNetConv2(num_feat * 8, num_feat * 8)
 
-        # Decoder con Skip Connections
         self.up1 = UNetUpBlock(num_feat * 8, num_feat * 8) 
         self.up2 = UNetUpBlock(num_feat * 8 * 2, num_feat * 4) 
         self.up3 = UNetUpBlock(num_feat * 4 * 2, num_feat * 2) 
-        self.up4 = UNetUpBlock(num_feat * 2 * 2, num_feat)     
+        self.up4 = UNetUpBlock(num_feat * 2 * 2, num_feat)      
 
-        # Output finale
         self.final_conv = nn.Sequential(
             spectral_norm(nn.Conv2d(num_feat * 2, num_feat, 3, 1, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
             spectral_norm(nn.Conv2d(num_feat, 1, 3, 1, 1, bias=False)) 
-            # Output raw logits per BCEWithLogitsLoss
         )
 
     def forward(self, x):
