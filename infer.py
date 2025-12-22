@@ -32,6 +32,35 @@ def save_as_tiff16(tensor, path):
     arr_u16 = (arr * 65535).astype(np.uint16)
     Image.fromarray(arr_u16, mode='I;16').save(path)
 
+def inference_tta(model, img, device):
+    """
+    Test-Time Augmentation (TTA) per 'smoothing' e riduzione rumore.
+    Esegue l'inferenza su 8 versioni dell'immagine (rotazioni + flip) e ne fa la media.
+    """
+    output_list = []
+    # 8 combinazioni: 4 rotazioni * 2 flip
+    for rot in [0, 1, 2, 3]:
+        for flip in [False, True]:
+            # 1. Augment
+            img_aug = torch.rot90(img, k=rot, dims=[2, 3])
+            if flip:
+                img_aug = torch.flip(img_aug, dims=[3])
+            
+            # 2. Inference
+            with torch.no_grad():
+                out_aug = model(img_aug)
+            
+            # 3. De-augment (inverso)
+            if flip:
+                out_aug = torch.flip(out_aug, dims=[3])
+            out_aug = torch.rot90(out_aug, k=-rot, dims=[2, 3])
+            
+            output_list.append(out_aug)
+    
+    # 4. Media delle predizioni (Smoothing)
+    output = torch.stack(output_list, dim=0).mean(dim=0)
+    return output
+
 def get_available_targets(output_root: Path) -> List[str]:
     if not output_root.is_dir(): return []
     return sorted([p.name for p in output_root.iterdir() if p.is_dir()])
@@ -39,8 +68,9 @@ def get_available_targets(output_root: Path) -> List[str]:
 def run_test(target_model_folder: str):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    print(f"Modalità SMOOTHING attiva (TTA x8) - L'elaborazione sarà più lenta ma più pulita.")
 
-    OUTPUT_DIR = OUTPUT_ROOT / target_model_folder / "test_results_tiff"
+    OUTPUT_DIR = OUTPUT_ROOT / target_model_folder / "test_results_smooth"
     CHECKPOINT_DIR = OUTPUT_ROOT / target_model_folder / "checkpoints"
     
     # Crea la cartella di output se non esiste
@@ -127,32 +157,30 @@ def run_test(target_model_folder: str):
             lr = batch['lr'].to(device)
             hr = batch['hr'].to(device)
             
-            # Inferenza
-            sr = model(lr)
+            # Inferenza con TTA (Smoothing)
+            sr = inference_tta(model, lr, device)
             
             # Calcolo Metriche
             sr_clamped = torch.clamp(sr, 0, 1)
             metrics.update(sr_clamped, hr)
             
             # Salvataggio Immagine
-            # Usiamo un indice progressivo per il nome file
-            filename = f"test_{i:04d}_sr.tiff"
+            filename = f"test_{i:04d}_sr_smooth.tiff"
             save_path = OUTPUT_DIR / filename
             save_as_tiff16(sr_clamped, save_path)
             
-            # Opzionale: Salva anche LR e HR per confronto rapido (commentare se non serve)
+            # Opzionale: Salva anche LR e HR per confronto rapido
             # save_as_tiff16(lr, OUTPUT_DIR / f"test_{i:04d}_lr.tiff")
             # save_as_tiff16(hr, OUTPUT_DIR / f"test_{i:04d}_hr.tiff")
 
     # --- RISULTATI FINALI ---
     avg_psnr = metrics.psnr / metrics.count if metrics.count > 0 else 0
-    avg_ssim = metrics.ssim / metrics.count if metrics.count > 0 else 0
+    # avg_ssim = metrics.ssim / metrics.count if metrics.count > 0 else 0
     
     print("\n" + "="*40)
     print(f"TEST COMPLETATO.")
     print(f"Immagini salvate in: {OUTPUT_DIR}")
     print(f"Average PSNR: {avg_psnr:.2f} dB")
-    # print(f"Average SSIM: {avg_ssim:.4f}") # Scommenta se TrainMetrics calcola SSIM
     print("="*40)
 
 if __name__ == "__main__":
