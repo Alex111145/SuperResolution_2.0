@@ -16,8 +16,7 @@ class TrainMetrics:
     def __init__(self): self.reset()
     def reset(self): self.psnr = 0.0; self.ssim = 0.0; self.count = 0
     def update(self, p, t):
-        p = p.clamp(0, 1)
-        t = t.clamp(0, 1)
+        p, t = p.clamp(0, 1), t.clamp(0, 1)
         mse = F.mse_loss(p, t, reduction='none').mean(dim=[1,2,3])
         self.psnr += (10 * torch.log10(1.0 / (mse + 1e-8))).sum().item()
         self.ssim += ssim_torch(p, t).item() * p.size(0)
