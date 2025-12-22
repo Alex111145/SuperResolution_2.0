@@ -1,5 +1,7 @@
 import sys
 import torch
+import torch.nn.functional as F
+import torchvision.utils as vutils
 import numpy as np
 import json
 from pathlib import Path
@@ -19,9 +21,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Import dai moduli del progetto
 try:
-    from models.architecture import SwinIR #
-    from dataset.astronomical_dataset import AstronomicalDataset #
-    from utils.metrics import TrainMetrics #
+    from models.architecture import SwinIR
+    from dataset.astronomical_dataset import AstronomicalDataset
+    from utils.metrics import TrainMetrics
 except ImportError as e:
     sys.exit(f"Errore Import: {e}. Verifica la struttura delle cartelle.")
 
@@ -35,14 +37,10 @@ def save_as_tiff16(tensor, path):
     Image.fromarray(arr_u16, mode='I;16').save(path)
 
 def detect_model_params(state_dict):
-    """
-    Tenta di dedurre i parametri del modello (embed_dim, depths) dal state_dict.
-    """
+    """Tenta di dedurre i parametri del modello dal state_dict."""
     params = {'embed_dim': 96, 'depths': [6, 6, 6, 6], 'num_heads': [6, 6, 6, 6]}
-    
     if 'conv_first.weight' in state_dict:
         params['embed_dim'] = state_dict['conv_first.weight'].shape[0]
-    
     max_layer_idx = -1
     for k in state_dict.keys():
         if k.startswith('layers.'):
@@ -50,7 +48,6 @@ def detect_model_params(state_dict):
                 idx = int(k.split('.')[1])
                 if idx > max_layer_idx: max_layer_idx = idx
             except: pass
-    
     num_layers = max_layer_idx + 1
     if num_layers > 0:
         params['depths'] = [6] * num_layers
@@ -64,12 +61,16 @@ def get_available_targets(output_root: Path) -> List[str]:
 def run_test(target_model_folder: str):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print("Modalità: Inferenza standard (singolo passaggio, NO TTA)")
+    print("Modalità: Inferenza standard con salvataggio comparativo PNG (Tris)")
 
-    # Percorsi file
-    OUTPUT_DIR = OUTPUT_ROOT / target_model_folder / "test_results_standard"
-    CHECKPOINT_DIR = OUTPUT_ROOT / target_model_folder / "checkpoints" #
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Percorsi cartelle risultati
+    BASE_RESULTS = OUTPUT_ROOT / target_model_folder / "test_results_standard"
+    TIFF_DIR = BASE_RESULTS / "tiff_16bit"
+    PNG_DIR = BASE_RESULTS / "comparison_png"
+    CHECKPOINT_DIR = OUTPUT_ROOT / target_model_folder / "checkpoints"
+
+    TIFF_DIR.mkdir(parents=True, exist_ok=True)
+    PNG_DIR.mkdir(parents=True, exist_ok=True)
     
     checkpoints = list(CHECKPOINT_DIR.glob("best_gan_model.pth"))
     if not checkpoints:
@@ -103,13 +104,13 @@ def run_test(target_model_folder: str):
 
     model.eval()
 
-    # Ricerca dei file JSON basata sul nome della cartella
+    # Ricerca JSON di test
     folder_clean = target_model_folder.replace("_DDP_SwinIR", "")
     targets_names = folder_clean.split("_")
     all_test_data = []
 
     for t in targets_names:
-        test_json_path = ROOT_DATA_DIR / t / "8_dataset_split" / "splits_json" / "test.json" #
+        test_json_path = ROOT_DATA_DIR / t / "8_dataset_split" / "splits_json" / "test.json"
         if test_json_path.exists():
             with open(test_json_path, 'r') as f:
                 all_test_data.extend(json.load(f))
@@ -118,13 +119,13 @@ def run_test(target_model_folder: str):
         print("Nessun dato di test trovato.")
         return
 
-    TEMP_JSON = OUTPUT_DIR / "temp_test.json"
+    TEMP_JSON = BASE_RESULTS / "temp_test.json"
     with open(TEMP_JSON, 'w') as f: json.dump(all_test_data, f)
 
-    test_ds = AstronomicalDataset(str(TEMP_JSON), base_path=PROJECT_ROOT, augment=False) #
+    test_ds = AstronomicalDataset(str(TEMP_JSON), base_path=PROJECT_ROOT, augment=False)
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=2)
     
-    metrics = TrainMetrics() #
+    metrics = TrainMetrics()
     
     print(f"Esecuzione su {len(test_ds)} immagini...")
 
@@ -133,16 +134,28 @@ def run_test(target_model_folder: str):
             lr = batch['lr'].to(device)
             hr = batch['hr'].to(device)
             
-            # --- INFERENZA DIRETTA ---
+            # 1. Inferenza
             sr = model(lr)
             sr_clamped = torch.clamp(sr, 0, 1)
             
+            # 2. Creazione Comparativa "Tris" (LR Upscalato | SR | HR)
+            # Upsample LR con nearest per matchare le dimensioni di SR e HR
+            lr_up = F.interpolate(lr, size=sr_clamped.shape[2:], mode='nearest')
+            
+            # Concatenazione orizzontale (dim=3)
+            comparison = torch.cat((lr_up, sr_clamped, hr), dim=3)
+            
+            # 3. Salvataggi
+            save_as_tiff16(sr_clamped, TIFF_DIR / f"test_{i:04d}_sr.tiff")
+            vutils.save_image(comparison, PNG_DIR / f"test_{i:04d}_tris.png")
+            
+            # Aggiornamento metriche
             metrics.update(sr_clamped, hr)
-            save_as_tiff16(sr_clamped, OUTPUT_DIR / f"test_{i:04d}_sr.tiff")
 
     avg_psnr = metrics.psnr / metrics.count if metrics.count > 0 else 0
     print(f"\nCOMPLETATO. PSNR Medio: {avg_psnr:.2f} dB")
-    print(f"Risultati salvati in: {OUTPUT_DIR}")
+    print(f"TIFF salvati in: {TIFF_DIR}")
+    print(f"PNG comparativi salvati in: {PNG_DIR}")
 
 if __name__ == "__main__":
     available = get_available_targets(OUTPUT_ROOT)
