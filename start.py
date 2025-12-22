@@ -4,15 +4,19 @@ import subprocess
 import torch
 from pathlib import Path
 
+# Configurazione percorsi
 CURRENT_SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_SCRIPT_DIR
 DATA_DIR = PROJECT_ROOT / "data"
-SCRIPT_PATH = PROJECT_ROOT / "train.py"
+# Percorso modificato per puntare al nuovo motore HAT
+SCRIPT_PATH = PROJECT_ROOT / "train_hat.py" 
 
 def clear_screen():
+    """Pulisce la console a seconda del sistema operativo."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def get_available_targets(required_subdir='8_dataset_split'):
+    """Identifica i target disponibili con split JSON pronti."""
     if not DATA_DIR.exists():
         return []
     
@@ -25,6 +29,7 @@ def get_available_targets(required_subdir='8_dataset_split'):
     return sorted(valid_subdirs)
 
 def get_available_gpus():
+    """Rileva le GPU NVIDIA disponibili tramite torch."""
     count = torch.cuda.device_count()
     gpus = []
     for i in range(count):
@@ -34,17 +39,17 @@ def get_available_gpus():
     return gpus
 
 def select_targets_interactive(targets):
-    print("Target disponibili per il training (con split pronti):")
+    """Interfaccia utente per la selezione dei target astronomici."""
+    print("Target disponibili per il training HAT (con split pronti):")
     for idx, t in enumerate(targets):
         print(f"   [{idx}] {t}")
     
     print("\nOpzioni di Selezione:")
     print("   [A] Tutti i target listati")
-    print("   [0,1,2] ID separati da virgola (es. 0,2)")
+    print("   [ID] Numeri separati da virgola (es. 0,2)")
     
     while True:
         sel = input("\nSeleziona target(s): ").strip().upper()
-        
         if sel == 'A':
             return targets
         
@@ -60,33 +65,28 @@ def select_targets_interactive(targets):
             
             if selected_names:
                 return selected_names
-            print("Selezione non valida o nessun target valido scelto.")
+            print("Selezione non valida.")
         except:
             print("Formato di input non valido.")
 
 def select_gpus_interactive(gpus):
+    """Interfaccia per la scelta delle GPU da usare in parallelo."""
     print("GPU Disponibili:")
     for g in gpus:
         print(f"   {g}")
     
-    print("\nOpzioni GPU:")
-    print("   [a] Usa TUTTE le GPU")
-    print("   [0,1] Inserisci ID separati da virgola (es. 0,2)")
-    
     while True:
-        sel = input("\nScelta GPU: ").strip().lower()
+        sel = input("\nScelta GPU (es. 'a' per tutte, o '0,1'): ").strip().lower()
         if sel == 'a':
             gpu_ids = [str(i) for i in range(len(gpus))]
             break
         else:
             try:
                 ids = [x.strip() for x in sel.split(',')]
-                valid = all(x.isdigit() and int(x) < len(gpus) for x in ids)
-                if valid and len(ids) > 0:
+                if all(x.isdigit() and int(x) < len(gpus) for x in ids) and len(ids) > 0:
                     gpu_ids = ids
                     break
-                else:
-                    print("ID GPU non validi.")
+                print("ID GPU non validi.")
             except:
                 print("Formato non valido.")
     
@@ -95,45 +95,35 @@ def select_gpus_interactive(gpus):
 def main():
     clear_screen()
     print("==========================================")
-    print("          SUPER RESOLUTION LAUNCHER      ")
+    print("      ASTRONOMICAL HAT LAUNCHER (XPixel)  ")
     print("==========================================\n")
 
     if not torch.cuda.is_available():
-        print("CUDA non disponibile. Impossibile avviare il training DDP.")
+        print("CUDA non disponibile. Impossibile avviare il training.")
         sys.exit(1)
         
-    try:
-        targets = get_available_targets()
-    except PermissionError as e:
-        print(f"Errore di Permessi: {e}")
-        print(f"Verifica i permessi della cartella: {DATA_DIR}")
-        sys.exit(1)
-        
+    targets = get_available_targets()
     if not targets:
-        print(f"Nessun target con split JSON pronti trovato in:")
-        print(f"{DATA_DIR}")
+        print(f"Nessun target trovato in: {DATA_DIR}")
         sys.exit(1)
     
     selected_target_names = select_targets_interactive(targets)
     target_env_string = ",".join(selected_target_names) 
 
-    print(f"\nTarget(s) selezionato(i): {target_env_string}\n")
-
     gpus = get_available_gpus()
     gpu_env_string, nproc = select_gpus_interactive(gpus)
     
-    print(f"\nGPU Selezionate: {gpu_env_string} (Totale processi: {nproc})")
-    
-    print("\n==========================================")
-    print("   Avvio Training DDP (Dataset Aggregato)...")
-    print("==========================================\n")
+    print(f"\nTarget: {target_env_string}")
+    print(f"GPU: {gpu_env_string} (Processi: {nproc})\n")
 
+    # Configurazione ambiente per il training distribuito
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_env_string
     env["NCCL_P2P_DISABLE"] = "1"
     env["NCCL_IB_DISABLE"] = "1"
     env["OMP_NUM_THREADS"] = "4"
 
+    # Comando per il lancio distribuito con HAT
     cmd = [
         sys.executable,
         "-m", "torch.distributed.run",
@@ -143,12 +133,13 @@ def main():
         "--target", target_env_string 
     ]
 
+    print("Avvio Training HAT Engine...")
     try:
         subprocess.run(cmd, env=env, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"\nErrore durante il training: {e}")
+        print(f"\nErrore durante l'addestramento: {e}")
     except KeyboardInterrupt:
-        print("\nTraining interrotto dall'utente.")
+        print("\nProcesso interrotto dall'utente.")
 
 if __name__ == "__main__":
     main()
