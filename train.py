@@ -177,8 +177,8 @@ def train_worker():
         pixel_weight=1.0, 
         perceptual_weight=0.5, 
         adversarial_weight=0.005,
-        hf_weight=1.0,    # IMPORTANTE: Forza il recupero delle stelle puntiformi
-        log_weight=0.5    # IMPORTANTE: Amplifica l'errore sulle zone scure
+        hf_weight=10.0,    # AUMENTATO: 1.0 -> 5.0 (Priorità estrema alle stelle puntiformi)
+        log_weight=4.0    # AUMENTATO: 0.5 -> 2.0 (Massima importanza alle nebulosità deboli)
     ).to(device)
     
     criterion_d = DiscriminatorLoss(gan_type='ragan').to(device)
