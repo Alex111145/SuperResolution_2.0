@@ -20,36 +20,31 @@ else:
     if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f" [WARN] Cartella BasicSR non trovata in: {BASICSR_PATH}")
 
-from models.hat_arch import HAT
+# CAMBIATO: Importiamo HybridSwinRRDB invece di HAT
+from models.architecture import HybridSwinRRDB
 from models.discriminator import UNetDiscriminatorSN
 from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
 
 # --- CONFIGURAZIONE ---
-BATCH_SIZE = 4
+BATCH_SIZE = 2  # Ridotto a 2 per gestire il peso maggiore dei blocchi RRDB
 LR_G = 1e-4
 LR_D = 1e-4
 NUM_EPOCHS = 300
-SAVE_INTERVAL = 5  # Salva modello e foto ogni 5 epoche
+SAVE_INTERVAL = 5 
 
 def tensor_to_img(tensor):
-    """Converte un tensore (C, H, W) in immagine numpy uint8."""
     img = tensor.cpu().detach().squeeze().float().numpy()
     img = np.clip(img, 0, 1)
     return (img * 255).astype(np.uint8)
 
 def save_validation_preview(lr, sr, hr, epoch, save_path):
-    """Salva un'immagine di confronto: LR (upscaled) | SR | HR"""
     lr_img = tensor_to_img(lr[0])
     sr_img = tensor_to_img(sr[0])
     hr_img = tensor_to_img(hr[0])
-    
-    # Ridimensiona LR per affiancarla (interpolazione nearest per vedere i pixel)
     h, w = sr_img.shape
     lr_pil = Image.fromarray(lr_img).resize((w, h), resample=Image.NEAREST)
     lr_img_resized = np.array(lr_pil)
-
-    # Crea immagine combinata
     combined = np.hstack((lr_img_resized, sr_img, hr_img))
     Image.fromarray(combined).save(save_path / f"epoch_{epoch}_preview.jpg")
 
@@ -78,17 +73,14 @@ def train_worker():
     if rank == 0:
         print(f"Avvio su {device}. Target: {args.target}")
 
-    # Dataset Combinato
-    targets = args.target.split(',')
     combined_json_path = "temp_train_combined.json"
-
     if rank == 0:
         all_pairs = []
+        targets = args.target.split(',')
         for t in targets:
             json_path = Path("./data") / t / "8_dataset_split" / "splits_json" / "train.json"
             if json_path.exists():
                 with open(json_path, 'r') as f: all_pairs.extend(json.load(f))
-        
         if not all_pairs: sys.exit("Nessun dato trovato.")
         with open(combined_json_path, 'w') as f: json.dump(all_pairs, f)
 
@@ -99,9 +91,19 @@ def train_worker():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=train_sampler, 
                               num_workers=4, pin_memory=True, persistent_workers=True)
 
-    # Modelli
-    net_g = HAT(img_size=128, in_chans=1, embed_dim=180, depths=(6,6,6,6,6,6), 
-                num_heads=(6,6,6,6,6,6), window_size=7, upscale=4, upsampler='pixelshuffle').to(device)
+    # MODIFICATO: Inizializzazione del Modello Ibrido Potenziato
+    # Combina Swin (Struttura) con 23 blocchi RRDB di Real-ESRGAN (Dettagli)
+    net_g = HybridSwinRRDB(
+        img_size=128, 
+        in_chans=1, 
+        embed_dim=180, 
+        depths=[6, 6, 6, 6, 6, 6], 
+        num_heads=[6, 6, 6, 6, 6, 6], 
+        window_size=7, 
+        upscale=4,
+        num_rrdb=23 # Configurazione massima potenza Real-ESRGAN
+    ).to(device)
+    
     net_d = UNetDiscriminatorSN(num_in_ch=1, num_feat=64).to(device)
 
     net_g = DDP(net_g, device_ids=[local_rank])
@@ -114,14 +116,11 @@ def train_worker():
     criterion_d = DiscriminatorLoss().to(device)
 
     if rank == 0: 
-        print("=== TRAINING AVVIATO ===")
+        print("=== TRAINING IBRIDO (SWIN + REAL-ESRGAN) AVVIATO ===")
 
     for epoch in range(1, NUM_EPOCHS + 1):
         train_sampler.set_epoch(epoch)
-        if rank == 0:
-            loader_bar = tqdm(train_loader, desc=f"Ep {epoch}", unit="bt", leave=True)
-        else:
-            loader_bar = train_loader
+        loader_bar = tqdm(train_loader, desc=f"Ep {epoch}") if rank == 0 else train_loader
 
         for i, batch in enumerate(loader_bar):
             lr = batch['lr'].to(device)
@@ -149,21 +148,16 @@ def train_worker():
             if rank == 0:
                 loader_bar.set_postfix({'G': f"{loss_g.item():.3f}", 'D': f"{loss_d.item():.3f}"})
 
-        # --- SALVATAGGIO CHECKPOINT E PREVIEW ---
         if rank == 0 and epoch % SAVE_INTERVAL == 0:
             ckpt_dir = Path("./outputs/checkpoints")
             preview_dir = Path("./outputs/previews")
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             preview_dir.mkdir(parents=True, exist_ok=True)
             
-            # Salva Modello
             torch.save(net_g.module.state_dict(), ckpt_dir / "latest_checkpoint.pth")
             torch.save(net_g.module.state_dict(), ckpt_dir / "best_gan_model.pth")
-            
-            # Salva Foto Preview
             save_validation_preview(lr, sr, hr, epoch, preview_dir)
-            
-            tqdm.write(f" [SAVE] Epoch {epoch}: Modello e Preview salvati.")
+            tqdm.write(f" [SAVE] Epoch {epoch}: Modello Ibrido e Preview salvati.")
 
     dist.destroy_process_group()
 
