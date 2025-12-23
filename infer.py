@@ -8,7 +8,6 @@ from tqdm import tqdm
 from models.hybrid_model import HybridHATRealESRGAN
 
 def load_model(checkpoint_path, device):
-    """Carica modello ibrido da checkpoint"""
     print(f"📦 Caricamento modello da {checkpoint_path}...")
     
     model = HybridHATRealESRGAN(
@@ -22,14 +21,11 @@ def load_model(checkpoint_path, device):
         num_rrdb=23
     ).to(device)
     
-    # Carica state dict
     state_dict = torch.load(checkpoint_path, map_location=device)
     
-    # Gestisci formati checkpoint diversi
     if 'model_state_dict' in state_dict:
         state_dict = state_dict['model_state_dict']
     
-    # Rimuovi prefisso "module." se presente (da DDP)
     state_dict_cleaned = {}
     for k, v in state_dict.items():
         k_cleaned = k.replace('module.', '')
@@ -44,21 +40,10 @@ def load_model(checkpoint_path, device):
     return model
 
 def process_image(img_path, model, device, tile_size=None, tile_overlap=32):
-    """
-    Processa singola immagine con tiling opzionale per immagini grandi
-    
-    Args:
-        img_path: Path immagine input
-        model: Modello PyTorch
-        device: Device (cuda/cpu)
-        tile_size: Se None, processa intera immagine. Altrimenti usa tiling.
-        tile_overlap: Overlap tra tiles (default 32px)
-    """
     img = Image.open(img_path).convert('L')
     img_np = np.array(img).astype(np.float32) / 255.0
     
     if tile_size is None:
-        # Processamento immagine intera
         img_tensor = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0).to(device)
         
         with torch.no_grad():
@@ -69,7 +54,6 @@ def process_image(img_path, model, device, tile_size=None, tile_overlap=32):
         return Image.fromarray(sr_np)
     
     else:
-        # Tiling per immagini grandi (TODO: implementare se necessario)
         raise NotImplementedError("Tiling non ancora implementato")
 
 def main():
@@ -89,7 +73,6 @@ def main():
                        help='Suffisso file output')
     args = parser.parse_args()
     
-    # Setup device
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     if args.device == 'cuda' and not torch.cuda.is_available():
         print("⚠️  CUDA non disponibile, uso CPU")
@@ -98,15 +81,12 @@ def main():
     print("🔮 INFERENZA MODELLO IBRIDO HAT + REAL-ESRGAN")
     print("=" * 70)
     
-    # Carica modello
     model = load_model(args.checkpoint, device)
     
-    # Setup paths
     input_path = Path(args.input)
     output_path = Path(args.output)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Trova immagini
     if input_path.is_file():
         images = [input_path]
     else:
@@ -123,7 +103,6 @@ def main():
     print(f"💾 Output: {output_path}")
     print("=" * 70)
     
-    # Processa immagini
     for img_path in tqdm(images, desc="Upscaling", unit="img"):
         try:
             sr_img = process_image(img_path, model, device)
