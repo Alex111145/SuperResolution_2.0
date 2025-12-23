@@ -22,7 +22,7 @@ from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
 
 # === CONFIGURAZIONE TRAINING ===
-BATCH_SIZE = 2  # Ridotto per modello pesante (HAT + 23 RRDB)
+BATCH_SIZE = 1 # Ridotto per modello pesante (HAT + 23 RRDB)
 LR_G = 1e-4
 LR_D = 1e-4
 NUM_EPOCHS = 300
@@ -135,14 +135,14 @@ def train_worker():
     net_g = HybridHATRealESRGAN(
         img_size=128,
         in_chans=1,
-        embed_dim=180,
-        depths=(6, 6, 6, 6, 6, 6),
-        num_heads=(6, 6, 6, 6, 6, 6),
+        embed_dim=90,
+        depths=(6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6),
         window_size=8,
         upscale=4,
-        num_rrdb=23,
-        num_feat=64,
-        num_grow_ch=32
+        num_rrdb=12,
+        num_feat=48,
+        num_grow_ch=24
     ).to(device)
 
     # Carica HAT pre-trained (opzionale)
