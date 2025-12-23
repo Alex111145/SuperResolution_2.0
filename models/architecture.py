@@ -4,7 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-# --- Moduli di Supporto ---
+# -------------------------------------------------------------------------
+# 1. MODULI BASE (Swin Transformer)
+# -------------------------------------------------------------------------
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -106,7 +108,6 @@ class SwinTransformerBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         
-        # Fix Crash Dimensionale: Adattamento dinamico della finestra
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
@@ -170,15 +171,10 @@ class PatchUnEmbed(nn.Module):
         B, HW, C = x.shape
         return x.transpose(1, 2).view(B, self.embed_dim, x_size[0], x_size[1])
 
-# --- Implementazione Richiesta: Smart Upscale ---
-
 class Upsample(nn.Sequential):
-    """
-    Modulo PixelShuffle per imparare i pixel mancanti ed evitare l'effetto sfocato.
-    """
     def __init__(self, scale, num_feat):
         m = []
-        if (scale & (scale - 1)) == 0:  # Scale 2, 4, 8...
+        if (scale & (scale - 1)) == 0:
             for _ in range(int(math.log(scale, 2))):
                 m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
                 m.append(nn.PixelShuffle(2))
@@ -189,23 +185,80 @@ class Upsample(nn.Sequential):
             raise ValueError(f'Scala {scale} non supportata. Usa potenze di 2 o 3.')
         super(Upsample, self).__init__(*m)
 
-class SwinIR(nn.Module):
+# -------------------------------------------------------------------------
+# 2. MODULI REAL-ESRGAN (RRDB - Residual in Residual Dense Block)
+# -------------------------------------------------------------------------
+
+class ResidualDenseBlock_5C(nn.Module):
+    def __init__(self, nf=64, gc=32, bias=True):
+        super(ResidualDenseBlock_5C, self).__init__()
+        # gc: growth channel, nf: number of features
+        self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1, bias=bias)
+        self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1, bias=bias)
+        self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1, bias=bias)
+        self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, 1, 1, bias=bias)
+        self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, 1, 1, bias=bias)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+        # Inizializzazione per stabilità
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
+                if m.bias is not None:
+                    m.bias.data.zero_()
+
+    def forward(self, x):
+        x1 = self.lrelu(self.conv1(x))
+        x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))
+        x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
+        x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
+        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
+        return x5 * 0.2 + x  # Residual scaling
+
+class RRDB(nn.Module):
+    """Residual in Residual Dense Block (Cuore di ESRGAN)."""
+    def __init__(self, nf, gc=32):
+        super(RRDB, self).__init__()
+        self.RDB1 = ResidualDenseBlock_5C(nf, gc)
+        self.RDB2 = ResidualDenseBlock_5C(nf, gc)
+        self.RDB3 = ResidualDenseBlock_5C(nf, gc)
+
+    def forward(self, x):
+        out = self.RDB1(x)
+        out = self.RDB2(out)
+        out = self.RDB3(out)
+        return out * 0.2 + x  # Residual scaling
+
+# -------------------------------------------------------------------------
+# 3. MODELLO IBRIDO (SwinIR + Real-ESRGAN)
+# -------------------------------------------------------------------------
+
+class HybridSwinRRDB(nn.Module):
+    """
+    MODELLO IBRIDO: 
+    Usa Swin Transformer per la struttura globale e RRDB (ESRGAN) per le texture.
+    """
     def __init__(self, img_size=64, in_chans=1, embed_dim=96, depths=[6, 6, 6], 
-                 num_heads=[6, 6, 6], window_size=7, upscale=2, **kwargs):
-        super(SwinIR, self).__init__()
+                 num_heads=[6, 6, 6], window_size=7, upscale=2, 
+                 num_rrdb=3,  # Numero di blocchi RRDB da inserire dopo Swin
+                 **kwargs):
+        super(HybridSwinRRDB, self).__init__()
         
         self.upscale = upscale
         self.window_size = window_size
         self.embed_dim = embed_dim
 
-        # 1. Shallow Feature Extraction
+        # 1. Feature Extraction (Convolutional)
         self.conv_first = nn.Conv2d(in_chans, embed_dim, 3, 1, 1)
 
-        # 2. Deep Feature Extraction (Swin Blocks)
+        # 2. Deep Feature Extraction (Swin Transformer Body)
         self.patch_embed = PatchEmbed(embed_dim=embed_dim)
         self.patch_unembed = PatchUnEmbed(embed_dim=embed_dim)
         
-        self.layers = nn.ModuleList()
+        self.swin_layers = nn.ModuleList()
         for i in range(len(depths)):
             layer = nn.ModuleList([
                 SwinTransformerBlock(
@@ -216,13 +269,22 @@ class SwinIR(nn.Module):
                     shift_size=0 if (j % 2 == 0) else window_size // 2
                 ) for j in range(depths[i])
             ])
-            self.layers.append(layer)
+            self.swin_layers.append(layer)
         
         self.norm = nn.LayerNorm(embed_dim)
-        self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+        self.conv_after_swin = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
 
-        # 3. Smart Upscale (PixelShuffle)
-        # Rimpiazza l'interpolazione bicubica con apprendimento dei pixel
+        # 3. Texture Refinement (Real-ESRGAN / RRDB Body)
+        # Inseriamo i blocchi RRDB qui per raffinare le features estratte dal Transformer
+        # prima di mandarle all'upsampler.
+        self.rrdb_blocks = nn.Sequential(*[
+            RRDB(nf=embed_dim, gc=32) for _ in range(num_rrdb)
+        ])
+        
+        # Convoluzione post-RRDB
+        self.conv_after_rrdb = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+
+        # 4. Upsampling & Reconstruction
         self.conv_before_upsample = nn.Sequential(
             nn.Conv2d(embed_dim, 64, 3, 1, 1),
             nn.LeakyReLU(inplace=True)
@@ -231,28 +293,41 @@ class SwinIR(nn.Module):
         self.conv_last = nn.Conv2d(64, in_chans, 3, 1, 1)
 
     def forward(self, x):
-        # Gestione automatica dimensioni per evitare RuntimeError
+        # Gestione padding dinamico (evita crash se dimensioni non divisibili per window_size)
         H, W = x.shape[2], x.shape[3]
         pad_h = (self.window_size - H % self.window_size) % self.window_size
         pad_w = (self.window_size - W % self.window_size) % self.window_size
-        x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
         
-        # Estrazione features
-        x_first = self.conv_first(x)
+        # --- Stage 1: Conv ---
+        x_first = self.conv_first(x_padded)
+        
+        # --- Stage 2: Swin Transformer (Global Features) ---
         res = self.patch_embed(x_first)
-        
-        for layer in self.layers:
+        for layer in self.swin_layers:
             for block in layer:
                 res = block(res)
-        
         res = self.norm(res)
-        res = self.patch_unembed(res, (x.shape[2], x.shape[3]))
-        res = self.conv_after_body(res) + x_first
+        res = self.patch_unembed(res, (x_padded.shape[2], x_padded.shape[3]))
         
-        # Smart Upscale
-        out = self.conv_before_upsample(res)
+        # Skip connection globale Swin
+        x_swin = self.conv_after_swin(res) + x_first
+        
+        # --- Stage 3: RRDB (Local Texture Refinement) ---
+        # Il Transformer ha fatto il lavoro grosso sulla struttura.
+        # Ora l'RRDB lavora sui dettagli ad alta frequenza.
+        x_rrdb = self.rrdb_blocks(x_swin)
+        x_refined = self.conv_after_rrdb(x_rrdb) + x_swin  # Residual connection anche qui
+        
+        # --- Stage 4: Upscale ---
+        out = self.conv_before_upsample(x_refined)
         out = self.upsample(out)
         out = self.conv_last(out)
         
-        # Crop finale per mantenere coerenza con l'input originale scalato
+        # Crop finale per tornare alle dimensioni target esatte
         return out[:, :, :H*self.upscale, :W*self.upscale]
+
+# Alias per compatibilità se richiami ancora SwinIR ma vuoi usare l'ibrido
+# Puoi cambiare questa riga in `SwinIR = HybridSwinRRDB` se vuoi sostituirlo ovunque
+class SwinIR(HybridSwinRRDB):
+    pass
