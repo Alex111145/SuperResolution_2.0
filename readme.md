@@ -1,5 +1,5 @@
-Smart Upscale (PixelShuffle): Ho inserito la classe Upsample che utilizza nn.PixelShuffle. A differenza del ridimensionamento standard, questo modulo utilizza i canali per ricostruire spazialmente l'immagine, eliminando l'effetto sfocato dell'interpolazione.
+PULIRE CODICEEEEEEEEEEEE
 
-Fix Crash Dimensionale: All'interno di SwinTransformerBlock, il sistema ora verifica se la risoluzione dell'input è inferiore alla window_size. In tal caso, riduce dinamicamente la finestra per evitare errori di calcolo.
+Riferimento Esplicito: Nel file start.py, l'intestazione dello script stampa a video: "ASTRONOMICAL HAT LAUNCHER (XPixel)".
 
-Gestione Dinamica (F.pad): Nel metodo forward di SwinIR, l'immagine viene automaticamente "paddata" (completata) per essere divisibile per la dimensione della finestra, prevenendo i tipici RuntimeError durante il partizionamento.
+Dipendenze Core: Il codice fa ampio uso di BasicSR (Basic Super Restoration), che è il framework open source sviluppato da XPixelGroup. Questo è evidente nelle importazioni all'interno di models/hat_arch.py e nella configurazione dell'ambiente in utils/env_setup.py.
