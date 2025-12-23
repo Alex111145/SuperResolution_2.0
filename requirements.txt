@@ -38,4 +38,4 @@ astroalign
 yapf
 
 # BasicSR (installa dopo se necessario)
-# basicsr
+basicsr
