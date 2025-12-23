@@ -22,12 +22,13 @@ from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
 
 # === CONFIGURAZIONE TRAINING ===
-BATCH_SIZE = 1 # Ridotto per modello pesante (HAT + 23 RRDB)
+BATCH_SIZE = 1 
 LR_G = 1e-4
 LR_D = 1e-4
 NUM_EPOCHS = 300
-SAVE_INTERVAL = 5
-GRADIENT_ACCUMULATION = 2  # Simula batch_size effettivo = 4
+SAVE_INTERVAL_CKPT = 3   # Checkpoint ogni 3 epoche [Richiesta Utente]
+SAVE_INTERVAL_IMG = 10   # Foto ogni 10 epoche [Richiesta Utente]
+GRADIENT_ACCUMULATION = 2  
 
 def tensor_to_img(tensor):
     """Converte tensore PyTorch in immagine numpy uint8"""
@@ -54,7 +55,6 @@ def setup_distributed():
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     else:
-        # Single GPU / CPU fallback
         os.environ["LOCAL_RANK"] = "0"
         os.environ["RANK"] = "0"
         os.environ["WORLD_SIZE"] = "1"
@@ -128,46 +128,28 @@ def train_worker():
     )
 
     # === INIZIALIZZAZIONE MODELLI ===
-    if rank == 0:
-        print("\n🏗️  Inizializzazione modelli...")
-
-    # Generatore: Modello Ibrido HAT + Real-ESRGAN
     net_g = HybridHATRealESRGAN(
-        img_size=128,
-        in_chans=1,
-        embed_dim=90,
-        depths=(6, 6, 6, 6),
-        num_heads=(6, 6, 6, 6),
-        window_size=8,
-        upscale=4,
-        num_rrdb=12,
-        num_feat=48,
-        num_grow_ch=24
+        img_size=128, in_chans=1, embed_dim=90, depths=(6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6), window_size=8, upscale=4,
+        num_rrdb=12, num_feat=48, num_grow_ch=24
     ).to(device)
 
-    # Carica HAT pre-trained (opzionale)
     if args.pretrained_hat and rank == 0:
         try:
             net_g.load_pretrained_hat(args.pretrained_hat)
         except Exception as e:
             print(f"⚠️  Impossibile caricare HAT pre-trained: {e}")
 
-    # Discriminatore
     net_d = UNetDiscriminatorSN(num_in_ch=1, num_feat=64).to(device)
-
-    # Distributed Data Parallel
     net_g = DDP(net_g, device_ids=[local_rank], find_unused_parameters=False)
     net_d = DDP(net_d, device_ids=[local_rank])
 
-    # === OTTIMIZZATORI ===
     opt_g = torch.optim.AdamW(net_g.parameters(), lr=LR_G, betas=(0.9, 0.99), weight_decay=0)
     opt_d = torch.optim.AdamW(net_d.parameters(), lr=LR_D, betas=(0.9, 0.99), weight_decay=0)
 
-    # === LOSS FUNCTIONS ===
     criterion_g = CombinedGANLoss(pixel_weight=1.0, adversarial_weight=0.005).to(device)
     criterion_d = DiscriminatorLoss().to(device)
 
-    # === RESUME TRAINING (opzionale) ===
     start_epoch = 1
     if args.resume and rank == 0:
         try:
@@ -179,14 +161,6 @@ def train_worker():
         except Exception as e:
             print(f"⚠️  Impossibile riprendere training: {e}")
 
-    if rank == 0:
-        total_params_g = sum(p.numel() for p in net_g.parameters())
-        total_params_d = sum(p.numel() for p in net_d.parameters())
-        print(f"\n📈 Parametri:")
-        print(f"   • Generatore (HAT+RRDB): {total_params_g:,}")
-        print(f"   • Discriminatore: {total_params_d:,}")
-        print("=" * 70)
-
     # === TRAINING LOOP ===
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         train_sampler.set_epoch(epoch)
@@ -194,12 +168,7 @@ def train_worker():
         net_d.train()
 
         if rank == 0:
-            loader_bar = tqdm(
-                train_loader,
-                desc=f"Epoch {epoch}/{NUM_EPOCHS}",
-                unit="batch",
-                ncols=100
-            )
+            loader_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}", unit="batch", ncols=100)
         else:
             loader_bar = train_loader
 
@@ -207,75 +176,60 @@ def train_worker():
             lr = batch['lr'].to(device, non_blocking=True)
             hr = batch['hr'].to(device, non_blocking=True)
 
-            # === TRAIN GENERATOR ===
-            for p in net_d.parameters():
-                p.requires_grad = False
-
+            # TRAIN GENERATOR
+            for p in net_d.parameters(): p.requires_grad = False
             sr = net_g(lr)
             pred_fake = net_d(sr)
             pred_real = net_d(hr).detach()
-            loss_g, loss_dict_g = criterion_g(sr, hr, pred_real, pred_fake)
-
-            loss_g = loss_g / GRADIENT_ACCUMULATION
-            loss_g.backward()
+            loss_g, _ = criterion_g(sr, hr, pred_real, pred_fake)
+            (loss_g / GRADIENT_ACCUMULATION).backward()
 
             if (i + 1) % GRADIENT_ACCUMULATION == 0:
                 opt_g.step()
                 opt_g.zero_grad()
 
-            # === TRAIN DISCRIMINATOR ===
-            for p in net_d.parameters():
-                p.requires_grad = True
-
+            # TRAIN DISCRIMINATOR
+            for p in net_d.parameters(): p.requires_grad = True
             pred_fake_d = net_d(sr.detach())
             pred_real_d = net_d(hr)
-            loss_d, loss_dict_d = criterion_d(pred_real_d, pred_fake_d)
-
-            loss_d = loss_d / GRADIENT_ACCUMULATION
-            loss_d.backward()
+            loss_d, _ = criterion_d(pred_real_d, pred_fake_d)
+            (loss_d / GRADIENT_ACCUMULATION).backward()
 
             if (i + 1) % GRADIENT_ACCUMULATION == 0:
                 opt_d.step()
                 opt_d.zero_grad()
 
-            # === LOGGING ===
             if rank == 0:
-                loader_bar.set_postfix({
-                    'L_G': f"{loss_g.item() * GRADIENT_ACCUMULATION:.4f}",
-                    'L_D': f"{loss_d.item() * GRADIENT_ACCUMULATION:.4f}"
-                })
+                loader_bar.set_postfix({'L_G': f"{loss_g.item():.4f}", 'L_D': f"{loss_d.item():.4f}"})
 
-        # === SALVATAGGIO CHECKPOINT ===
-        if rank == 0 and epoch % SAVE_INTERVAL == 0:
+        # === LOGICA DI SALVATAGGIO SEPARATA ===
+        if rank == 0:
             target_folder_name = args.target.replace(',', '_')
             base_output_dir = Path("./outputs") / target_folder_name
             ckpt_dir = base_output_dir / "checkpoints"
             preview_dir = base_output_dir / "previews"
-
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             preview_dir.mkdir(parents=True, exist_ok=True)
 
-            # Salva checkpoint completo
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': net_g.module.state_dict(),
-                'optimizer_state_dict': opt_g.state_dict(),
-                'loss_g': loss_g.item() * GRADIENT_ACCUMULATION,
-                'loss_d': loss_d.item() * GRADIENT_ACCUMULATION
-            }
-            torch.save(checkpoint, ckpt_dir / f"hybrid_epoch_{epoch:03d}.pth")
-            torch.save(net_g.module.state_dict(), ckpt_dir / "best_hybrid_model.pth")
+            # Salvataggio Checkpoint ogni 3 epoche
+            if epoch % SAVE_INTERVAL_CKPT == 0:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': net_g.module.state_dict(),
+                    'optimizer_state_dict': opt_g.state_dict(),
+                    'loss_g': loss_g.item(),
+                    'loss_d': loss_d.item()
+                }
+                torch.save(checkpoint, ckpt_dir / f"hybrid_epoch_{epoch:03d}.pth")
+                torch.save(net_g.module.state_dict(), ckpt_dir / "best_hybrid_model.pth")
+                tqdm.write(f"💾 Epoch {epoch}: Checkpoint salvato.")
 
-            # Salva preview
-            save_validation_preview(lr, sr, hr, epoch, preview_dir)
+            # Salvataggio Preview ogni 10 epoche
+            if epoch % SAVE_INTERVAL_IMG == 0:
+                save_validation_preview(lr, sr, hr, epoch, preview_dir)
+                tqdm.write(f"🖼️  Epoch {epoch}: Preview immagine salvata.")
 
-            tqdm.write(f"💾 Epoch {epoch}: Checkpoint salvato in {base_output_dir}")
-
-    if rank == 0:
-        print("\n" + "=" * 70)
-        print("✅ TRAINING COMPLETATO!")
-        print("=" * 70)
-
+    if rank == 0: print("\n✅ TRAINING COMPLETATO!")
     dist.destroy_process_group()
 
 if __name__ == "__main__":
