@@ -1,32 +1,41 @@
+# PyTorch e CUDA (installa per primo)
 --extra-index-url https://download.pytorch.org/whl/cu118
-
-numpy<2.0
-pandas
-scipy
-matplotlib
-pyyaml
-future
-scikit-image
-opencv-python
-Pillow
-astropy
-reproject
-astroalign
 torch>=2.0.0
 torchvision
 torchaudio
-tensorboard 
+
+# Core Dependencies
+numpy<2.0
+scipy
+Pillow
+opencv-python
+tqdm
+
+# Machine Learning
 einops
 timm
-nvitop 
-tqdm
+
+# Monitoring & Logging
+tensorboard
+nvitop
+
+# Data Processing
+pandas
+pyyaml
 lmdb
 addict
+
+# Image Processing
+scikit-image
+matplotlib
+
+# Astronomy (se necessario)
+astropy
+reproject
+astroalign
+
+# Code Formatting (opzionale)
 yapf
-torch>=1.9.0
-torchvision
-tensorboard
-tqdm
-numpy
-Pillow
-timm
+
+# BasicSR (installa dopo se necessario)
+# basicsr
