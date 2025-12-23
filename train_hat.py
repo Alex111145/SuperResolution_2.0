@@ -12,7 +12,8 @@ from tqdm import tqdm
 from PIL import Image
 
 # === IMPORT MODELLO IBRIDO ===
-from models.hybrid_model import HybridHATRealESRGAN
+from models.hybridmodels import HybridHATRealESRGAN
+
 from models.discriminator import UNetDiscriminatorSN
 from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
@@ -276,3 +277,4 @@ def train_worker():
 
 if __name__ == "__main__":
     train_worker()
+
