@@ -4,8 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-# --- Moduli di Supporto ---
-
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -106,7 +104,6 @@ class SwinTransformerBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         
-        # Fix Crash Dimensionale: Adattamento dinamico della finestra
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
@@ -170,15 +167,10 @@ class PatchUnEmbed(nn.Module):
         B, HW, C = x.shape
         return x.transpose(1, 2).view(B, self.embed_dim, x_size[0], x_size[1])
 
-# --- Implementazione Richiesta: Smart Upscale ---
-
 class Upsample(nn.Sequential):
-    """
-    Modulo PixelShuffle per imparare i pixel mancanti ed evitare l'effetto sfocato.
-    """
     def __init__(self, scale, num_feat):
         m = []
-        if (scale & (scale - 1)) == 0:  # Scale 2, 4, 8...
+        if (scale & (scale - 1)) == 0:
             for _ in range(int(math.log(scale, 2))):
                 m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
                 m.append(nn.PixelShuffle(2))
@@ -198,10 +190,8 @@ class SwinIR(nn.Module):
         self.window_size = window_size
         self.embed_dim = embed_dim
 
-        # 1. Shallow Feature Extraction
         self.conv_first = nn.Conv2d(in_chans, embed_dim, 3, 1, 1)
 
-        # 2. Deep Feature Extraction (Swin Blocks)
         self.patch_embed = PatchEmbed(embed_dim=embed_dim)
         self.patch_unembed = PatchUnEmbed(embed_dim=embed_dim)
         
@@ -221,8 +211,6 @@ class SwinIR(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
         self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
 
-        # 3. Smart Upscale (PixelShuffle)
-        # Rimpiazza l'interpolazione bicubica con apprendimento dei pixel
         self.conv_before_upsample = nn.Sequential(
             nn.Conv2d(embed_dim, 64, 3, 1, 1),
             nn.LeakyReLU(inplace=True)
@@ -231,13 +219,11 @@ class SwinIR(nn.Module):
         self.conv_last = nn.Conv2d(64, in_chans, 3, 1, 1)
 
     def forward(self, x):
-        # Gestione automatica dimensioni per evitare RuntimeError
         H, W = x.shape[2], x.shape[3]
         pad_h = (self.window_size - H % self.window_size) % self.window_size
         pad_w = (self.window_size - W % self.window_size) % self.window_size
         x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
         
-        # Estrazione features
         x_first = self.conv_first(x)
         res = self.patch_embed(x_first)
         
@@ -249,10 +235,8 @@ class SwinIR(nn.Module):
         res = self.patch_unembed(res, (x.shape[2], x.shape[3]))
         res = self.conv_after_body(res) + x_first
         
-        # Smart Upscale
         out = self.conv_before_upsample(res)
         out = self.upsample(out)
         out = self.conv_last(out)
         
-        # Crop finale per mantenere coerenza con l'input originale scalato
         return out[:, :, :H*self.upscale, :W*self.upscale]
