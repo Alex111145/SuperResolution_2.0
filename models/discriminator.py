@@ -1,55 +1,50 @@
-import torch
-from torch import nn
+from basicsr.utils.registry import ARCH_REGISTRY
+from torch import nn as nn
 from torch.nn import functional as F
 from torch.nn.utils import spectral_norm
 
-class UNetConv2(nn.Module):
-    def __init__(self, in_size, out_size):
-        super(UNetConv2, self).__init__()
-        self.model = nn.Sequential(
-            spectral_norm(nn.Conv2d(in_size, out_size, 4, 2, 1, bias=False)),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-    def forward(self, x): return self.model(x)
 
-class UNetUpBlock(nn.Module):
-    def __init__(self, in_size, out_size):
-        super(UNetUpBlock, self).__init__()
-        self.model = nn.Sequential(
-            spectral_norm(nn.ConvTranspose2d(in_size, out_size, 4, 2, 1, bias=False)),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-    def forward(self, x, skip_input):
-        x = self.model(x)
-        out = torch.cat((x, skip_input), 1)
-        return out
-
+@ARCH_REGISTRY.register()
 class UNetDiscriminatorSN(nn.Module):
-    def __init__(self, num_in_ch=1, num_feat=64):
+    def __init__(self, num_in_ch, num_feat=64, skip_connection=True):
         super(UNetDiscriminatorSN, self).__init__()
-        self.conv0 = nn.Sequential(
-            spectral_norm(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1, bias=False)),
-            nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv2d(num_feat, num_feat, 4, 2, 1, bias=False)),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.conv1 = UNetConv2(num_feat, num_feat * 2)
-        self.conv2 = UNetConv2(num_feat * 2, num_feat * 4)
-        self.conv3 = UNetConv2(num_feat * 4, num_feat * 8)
-        self.conv4 = UNetConv2(num_feat * 8, num_feat * 8)
-
-        self.up1 = UNetUpBlock(num_feat * 8, num_feat * 8) 
-        self.up2 = UNetUpBlock(num_feat * 16, num_feat * 4) 
-        self.up3 = UNetUpBlock(num_feat * 8, num_feat * 2) 
-        self.up4 = UNetUpBlock(num_feat * 4, num_feat)      
-
-        self.final_conv = nn.Sequential(
-            spectral_norm(nn.Conv2d(num_feat * 2, num_feat, 3, 1, 1, bias=False)),
-            nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv2d(num_feat, 1, 3, 1, 1, bias=False)) 
-        )
+        self.skip_connection = skip_connection
+        norm = spectral_norm
+        self.conv0 = nn.Conv2d(num_in_ch, num_feat, kernel_size=3, stride=1, padding=1)
+        self.conv1 = norm(nn.Conv2d(num_feat, num_feat * 2, 4, 2, 1, bias=False))
+        self.conv2 = norm(nn.Conv2d(num_feat * 2, num_feat * 4, 4, 2, 1, bias=False))
+        self.conv3 = norm(nn.Conv2d(num_feat * 4, num_feat * 8, 4, 2, 1, bias=False))
+        self.conv4 = norm(nn.Conv2d(num_feat * 8, num_feat * 4, 3, 1, 1, bias=False))
+        self.conv5 = norm(nn.Conv2d(num_feat * 4, num_feat * 2, 3, 1, 1, bias=False))
+        self.conv6 = norm(nn.Conv2d(num_feat * 2, num_feat, 3, 1, 1, bias=False))
+        self.conv7 = norm(nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=False))
+        self.conv8 = norm(nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=False))
+        self.conv9 = nn.Conv2d(num_feat, 1, 3, 1, 1)
 
     def forward(self, x):
-        x0 = self.conv0(x); x1 = self.conv1(x0); x2 = self.conv2(x1); x3 = self.conv3(x2); x4 = self.conv4(x3)
-        d1 = self.up1(x4, x3); d2 = self.up2(d1, x2); d3 = self.up3(d2, x1); d4 = self.up4(d3, x0)
-        return self.final_conv(d4)
+        x0 = F.leaky_relu(self.conv0(x), negative_slope=0.2, inplace=True)
+        x1 = F.leaky_relu(self.conv1(x0), negative_slope=0.2, inplace=True)
+        x2 = F.leaky_relu(self.conv2(x1), negative_slope=0.2, inplace=True)
+        x3 = F.leaky_relu(self.conv3(x2), negative_slope=0.2, inplace=True)
+
+        x3 = F.interpolate(x3, scale_factor=2, mode='bilinear', align_corners=False)
+        x4 = F.leaky_relu(self.conv4(x3), negative_slope=0.2, inplace=True)
+
+        if self.skip_connection:
+            x4 = x4 + x2
+        x4 = F.interpolate(x4, scale_factor=2, mode='bilinear', align_corners=False)
+        x5 = F.leaky_relu(self.conv5(x4), negative_slope=0.2, inplace=True)
+
+        if self.skip_connection:
+            x5 = x5 + x1
+        x5 = F.interpolate(x5, scale_factor=2, mode='bilinear', align_corners=False)
+        x6 = F.leaky_relu(self.conv6(x5), negative_slope=0.2, inplace=True)
+
+        if self.skip_connection:
+            x6 = x6 + x0
+
+        out = F.leaky_relu(self.conv7(x6), negative_slope=0.2, inplace=True)
+        out = F.leaky_relu(self.conv8(out), negative_slope=0.2, inplace=True)
+        out = self.conv9(out)
+
+        return out
