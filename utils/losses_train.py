@@ -14,7 +14,7 @@ class VGGLoss(nn.Module):
         self.register_buffer('std', torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, x, y):
-        if x.shape[1] == 1: x = x.repeat(1, 3, 1, 1) # Da Mono a RGB per VGG
+        if x.shape[1] == 1: x = x.repeat(1, 3, 1, 1)
         if y.shape[1] == 1: y = y.repeat(1, 3, 1, 1)
         x = (x - self.mean) / self.std
         y = (y - self.mean) / self.std
