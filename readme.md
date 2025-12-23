@@ -19,3 +19,4 @@ source venv/bin/activate
 # Installa le dipendenze HAT
 pip install timm einops
 
+pip install einops
