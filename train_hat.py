@@ -7,29 +7,28 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from pathlib import Path
+from tqdm import tqdm  # Importiamo la barra di avanzamento
 
-# --- FIX IMPORT PRIORITARIO ---
-# Questo blocco deve stare PRIMA di importare i modelli
-# Serve a rendere visibile la libreria 'basicsr' contenuta in models/BasicSR
+# --- FIX IMPORT PRIORITARIO (Per evitare ModuleNotFoundError: basicsr) ---
+# Questo blocco rende visibile la cartella models/BasicSR a Python
 CURRENT_DIR = Path(__file__).resolve().parent
 BASICSR_PATH = CURRENT_DIR / "models" / "BasicSR"
 if BASICSR_PATH.exists():
     sys.path.insert(0, str(BASICSR_PATH))
-    print(f" [SETUP] Aggiunto al path: {BASICSR_PATH}")
 else:
-    print(f" [ERR] ATTENZIONE: La cartella {BASICSR_PATH} non esiste! Il training potrebbe fallire.")
-# ------------------------------
+    # Fallback se non esiste, stampa un warning ma prova a continuare
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        print(f" [WARN] Cartella BasicSR non trovata in: {BASICSR_PATH}")
+# -----------------------------------------------------------------------
 
 # Imports dai moduli del progetto
-# Ora questi import funzioneranno perché il path è stato corretto sopra
 from models.hat_arch import HAT
 from models.discriminator import UNetDiscriminatorSN
 from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
-from utils.metrics import TrainMetrics
 
 # --- CONFIGURAZIONE IPERPARAMETRI ---
-BATCH_SIZE = 4       # Se la VRAM si riempie, abbassa a 2
+BATCH_SIZE = 4       
 LR_G = 1e-4
 LR_D = 1e-4
 NUM_EPOCHS = 300
@@ -40,7 +39,6 @@ def setup():
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     else:
-        # Fallback debug
         print("Attenzione: DDP non rilevato. Esecuzione Single-GPU/CPU.")
         os.environ["LOCAL_RANK"] = "0"
         os.environ["RANK"] = "0"
@@ -50,7 +48,7 @@ def setup():
         dist.init_process_group(backend="gloo")
 
 def train_worker():
-    # 1. PARSING ARGOMENTI (Riceve i target da start.py)
+    # 1. PARSING ARGOMENTI
     parser = argparse.ArgumentParser()
     parser.add_argument('--target', type=str, required=True, help='Lista target separati da virgola')
     args, unknown = parser.parse_known_args()
@@ -65,7 +63,6 @@ def train_worker():
         print(f"Avvio processo su {device}. Target: {args.target}")
 
     # 2. PREPARAZIONE DATASET COMBINATO
-    # Uniamo i file json dei target selezionati in un unico file temporaneo
     targets = args.target.split(',')
     base_data_path = Path("./data") 
     combined_json_path = "temp_train_combined.json"
@@ -75,7 +72,6 @@ def train_worker():
         all_pairs = []
         found_any = False
         for t in targets:
-            # Percorso: data/{TARGET}/8_dataset_split/splits_json/train.json
             json_path = base_data_path / t / "8_dataset_split" / "splits_json" / "train.json"
             if json_path.exists():
                 with open(json_path, 'r') as f:
@@ -94,7 +90,6 @@ def train_worker():
             json.dump(all_pairs, f)
         print(f" Dataset combinato salvato: {combined_json_path} ({len(all_pairs)} immagini)")
 
-    # Barriera: Tutti i processi aspettano che il file sia pronto
     dist.barrier()
 
     # 3. CARICAMENTO DATASET
@@ -145,18 +140,24 @@ def train_worker():
 
     for epoch in range(1, NUM_EPOCHS + 1):
         train_sampler.set_epoch(epoch)
-        for i, batch in enumerate(train_loader):
+        
+        # Configurazione Barra di Avanzamento (Solo su Rank 0)
+        if rank == 0:
+            # Crea la barra tqdm che wrappa il loader
+            loader_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}", unit="batch", leave=True)
+        else:
+            # Gli altri processi usano il loader normale silenzioso
+            loader_bar = train_loader
+
+        for i, batch in enumerate(loader_bar):
             lr = batch['lr'].to(device)
             hr = batch['hr'].to(device)
 
             # --- A. TRAINING GENERATORE (HAT) ---
-            # Blocca gradienti D per efficienza
             for p in net_d.parameters(): p.requires_grad = False
             opt_g.zero_grad()
 
             sr = net_g(lr)
-            
-            # Predizioni per Loss (senza aggiornare D)
             pred_fake = net_d(sr)
             pred_real = net_d(hr).detach() 
             
@@ -168,7 +169,6 @@ def train_worker():
             for p in net_d.parameters(): p.requires_grad = True
             opt_d.zero_grad()
             
-            # Detach necessario per non intaccare G
             pred_fake_d = net_d(sr.detach())
             pred_real_d = net_d(hr)
             
@@ -176,18 +176,22 @@ def train_worker():
             loss_d_total.backward()
             opt_d.step()
 
-            # --- LOGGING ---
-            if rank == 0 and i % 10 == 0:
-                print(f"Epoch {epoch} | Batch {i} | G_Loss: {loss_g_total.item():.4f} | D_Loss: {loss_d_total.item():.4f}")
+            # --- AGGIORNAMENTO BARRA (Solo Rank 0) ---
+            if rank == 0:
+                # Aggiorna la descrizione della barra con le loss attuali
+                loader_bar.set_postfix({
+                    'G_Loss': f"{loss_g_total.item():.4f}",
+                    'D_Loss': f"{loss_d_total.item():.4f}"
+                })
 
         # Salvataggio Checkpoint (Solo Rank 0)
         if rank == 0 and epoch % 5 == 0:
             save_dir = Path("./outputs/checkpoints")
             save_dir.mkdir(parents=True, exist_ok=True)
-            # Salviamo il modulo interno (senza DDP wrapper) per facilitare l'inferenza
             torch.save(net_g.module.state_dict(), save_dir / "latest_checkpoint.pth")
             torch.save(net_g.module.state_dict(), save_dir / "best_gan_model.pth")
-            print(f"Checkpoint salvato: Epoch {epoch}")
+            # tqdm.write usa stdout in modo sicuro senza rompere la barra
+            tqdm.write(f" [CHECKPOINT] Salvato modello epoch {epoch}")
 
     dist.destroy_process_group()
 
