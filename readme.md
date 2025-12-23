@@ -1,7 +1,7 @@
 PULIRE CODICEEEEEEEEEEEE
 
 
-HAT E REAL 
+HAT E basic 
 
 
 serve solo la cartella basic  e hat
