@@ -25,7 +25,7 @@ class AstronomicalDataset(Dataset):
             img = Image.open(path)
             img.load() 
             arr = np.array(img, dtype=np.float32)
-            arr = arr / 65535.0  # Normalizzazione per dati 16-bit
+            arr = arr / 65535.0
             tensor = torch.from_numpy(arr)
             if tensor.ndim == 2:
                 tensor = tensor.unsqueeze(0)
