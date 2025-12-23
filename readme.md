@@ -20,3 +20,4 @@ source venv/bin/activate
 pip install timm einops
 
 pip install einops
+pip install basicsr
