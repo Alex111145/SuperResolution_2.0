@@ -11,33 +11,28 @@ from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
 
-# === PATCH TORCHVISION ===
 import torchvision.transforms.functional as TF_functional
 sys.modules['torchvision.transforms.functional_tensor'] = TF_functional
 
-# === IMPORT MODELLO IBRIDO ===
 from models.hybridmodels import HybridHATRealESRGAN
 from models.discriminator import UNetDiscriminatorSN
 from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
 
-# === CONFIGURAZIONE TRAINING ===
 BATCH_SIZE = 1 
 LR_G = 1e-4
 LR_D = 1e-4
 NUM_EPOCHS = 300
-SAVE_INTERVAL_CKPT = 3   # Checkpoint ogni 3 epoche [Richiesta Utente]
-SAVE_INTERVAL_IMG = 10   # Foto ogni 10 epoche [Richiesta Utente]
+SAVE_INTERVAL_CKPT = 3
+SAVE_INTERVAL_IMG = 10
 GRADIENT_ACCUMULATION = 2  
 
 def tensor_to_img(tensor):
-    """Converte tensore PyTorch in immagine numpy uint8"""
     img = tensor.cpu().detach().squeeze().float().numpy()
     img = np.clip(img, 0, 1)
     return (img * 255).astype(np.uint8)
 
 def save_validation_preview(lr, sr, hr, epoch, save_path):
-    """Salva preview comparativa: LR | SR | HR"""
     lr_img = tensor_to_img(lr[0])
     sr_img = tensor_to_img(sr[0])
     hr_img = tensor_to_img(hr[0])
@@ -50,7 +45,6 @@ def save_validation_preview(lr, sr, hr, epoch, save_path):
     Image.fromarray(combined).save(save_path / f"epoch_{epoch:03d}_preview.png")
 
 def setup_distributed():
-    """Setup training distribuito (multi-GPU)"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -90,7 +84,6 @@ def train_worker():
         print(f"   • Target(s): {args.target}")
         print("=" * 70)
 
-    # === PREPARAZIONE DATASET ===
     targets = args.target.split(',')
     combined_json_path = "temp_train_combined.json"
 
@@ -127,7 +120,6 @@ def train_worker():
         drop_last=True
     )
 
-    # === INIZIALIZZAZIONE MODELLI ===
     net_g = HybridHATRealESRGAN(
         img_size=128, in_chans=1, embed_dim=90, depths=(6, 6, 6, 6),
         num_heads=(6, 6, 6, 6), window_size=8, upscale=4,
@@ -161,7 +153,6 @@ def train_worker():
         except Exception as e:
             print(f"⚠️  Impossibile riprendere training: {e}")
 
-    # === TRAINING LOOP ===
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         train_sampler.set_epoch(epoch)
         net_g.train()
@@ -176,7 +167,6 @@ def train_worker():
             lr = batch['lr'].to(device, non_blocking=True)
             hr = batch['hr'].to(device, non_blocking=True)
 
-            # TRAIN GENERATOR
             for p in net_d.parameters(): p.requires_grad = False
             sr = net_g(lr)
             pred_fake = net_d(sr)
@@ -188,7 +178,6 @@ def train_worker():
                 opt_g.step()
                 opt_g.zero_grad()
 
-            # TRAIN DISCRIMINATOR
             for p in net_d.parameters(): p.requires_grad = True
             pred_fake_d = net_d(sr.detach())
             pred_real_d = net_d(hr)
@@ -202,7 +191,6 @@ def train_worker():
             if rank == 0:
                 loader_bar.set_postfix({'L_G': f"{loss_g.item():.4f}", 'L_D': f"{loss_d.item():.4f}"})
 
-        # === LOGICA DI SALVATAGGIO SEPARATA ===
         if rank == 0:
             target_folder_name = args.target.replace(',', '_')
             base_output_dir = Path("./outputs") / target_folder_name
@@ -211,7 +199,6 @@ def train_worker():
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             preview_dir.mkdir(parents=True, exist_ok=True)
 
-            # Salvataggio Checkpoint ogni 3 epoche
             if epoch % SAVE_INTERVAL_CKPT == 0:
                 checkpoint = {
                     'epoch': epoch,
@@ -224,7 +211,6 @@ def train_worker():
                 torch.save(net_g.module.state_dict(), ckpt_dir / "best_hybrid_model.pth")
                 tqdm.write(f"💾 Epoch {epoch}: Checkpoint salvato.")
 
-            # Salvataggio Preview ogni 10 epoche
             if epoch % SAVE_INTERVAL_IMG == 0:
                 save_validation_preview(lr, sr, hr, epoch, preview_dir)
                 tqdm.write(f"🖼️  Epoch {epoch}: Preview immagine salvata.")
