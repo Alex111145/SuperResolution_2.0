@@ -11,7 +11,6 @@ from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
 
-# --- FIX IMPORT PRIORITARIO ---
 CURRENT_DIR = Path(__file__).resolve().parent
 BASICSR_PATH = CURRENT_DIR / "models" / "BasicSR"
 if BASICSR_PATH.exists():
@@ -25,31 +24,26 @@ from models.discriminator import UNetDiscriminatorSN
 from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
 
-# --- CONFIGURAZIONE ---
 BATCH_SIZE = 4
 LR_G = 1e-4
 LR_D = 1e-4
 NUM_EPOCHS = 300
-SAVE_INTERVAL = 5  # Salva modello e foto ogni 5 epoche
+SAVE_INTERVAL = 5
 
 def tensor_to_img(tensor):
-    """Converte un tensore (C, H, W) in immagine numpy uint8."""
     img = tensor.cpu().detach().squeeze().float().numpy()
     img = np.clip(img, 0, 1)
     return (img * 255).astype(np.uint8)
 
 def save_validation_preview(lr, sr, hr, epoch, save_path):
-    """Salva un'immagine di confronto: LR (upscaled) | SR | HR"""
     lr_img = tensor_to_img(lr[0])
     sr_img = tensor_to_img(sr[0])
     hr_img = tensor_to_img(hr[0])
     
-    # Ridimensiona LR per affiancarla (interpolazione nearest per vedere i pixel)
     h, w = sr_img.shape
     lr_pil = Image.fromarray(lr_img).resize((w, h), resample=Image.NEAREST)
     lr_img_resized = np.array(lr_pil)
 
-    # Crea immagine combinata
     combined = np.hstack((lr_img_resized, sr_img, hr_img))
     Image.fromarray(combined).save(save_path / f"epoch_{epoch}_preview.jpg")
 
@@ -78,7 +72,6 @@ def train_worker():
     if rank == 0:
         print(f"Avvio su {device}. Target: {args.target}")
 
-    # Dataset Combinato
     targets = args.target.split(',')
     combined_json_path = "temp_train_combined.json"
 
@@ -99,7 +92,6 @@ def train_worker():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=train_sampler, 
                               num_workers=4, pin_memory=True, persistent_workers=True)
 
-    # Modelli
     net_g = HAT(img_size=128, in_chans=1, embed_dim=180, depths=(6,6,6,6,6,6), 
                 num_heads=(6,6,6,6,6,6), window_size=7, upscale=4, upsampler='pixelshuffle').to(device)
     net_d = UNetDiscriminatorSN(num_in_ch=1, num_feat=64).to(device)
@@ -127,7 +119,6 @@ def train_worker():
             lr = batch['lr'].to(device)
             hr = batch['hr'].to(device)
 
-            # Train G
             for p in net_d.parameters(): p.requires_grad = False
             opt_g.zero_grad()
             sr = net_g(lr)
@@ -137,7 +128,6 @@ def train_worker():
             loss_g.backward()
             opt_g.step()
 
-            # Train D
             for p in net_d.parameters(): p.requires_grad = True
             opt_d.zero_grad()
             pred_fake_d = net_d(sr.detach())
@@ -149,12 +139,9 @@ def train_worker():
             if rank == 0:
                 loader_bar.set_postfix({'G': f"{loss_g.item():.3f}", 'D': f"{loss_d.item():.3f}"})
 
-        # --- SALVATAGGIO CHECKPOINT E PREVIEW ---
         if rank == 0 and epoch % SAVE_INTERVAL == 0:
-            # Sostituisce la virgola con underscore per creare il nome cartella (es. target1_target2)
             target_folder_name = args.target.replace(',', '_')
             
-            # Percorsi aggiornati: outputs/NOME_TARGET/checkpoints
             base_output_dir = Path("./outputs") / target_folder_name
             ckpt_dir = base_output_dir / "checkpoints"
             preview_dir = base_output_dir / "previews"
@@ -162,11 +149,9 @@ def train_worker():
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             preview_dir.mkdir(parents=True, exist_ok=True)
             
-            # Salva Modello
             torch.save(net_g.module.state_dict(), ckpt_dir / "latest_checkpoint.pth")
             torch.save(net_g.module.state_dict(), ckpt_dir / "best_gan_model.pth")
             
-            # Salva Foto Preview
             save_validation_preview(lr, sr, hr, epoch, preview_dir)
             
             tqdm.write(f" [SAVE] Epoch {epoch}: Modello e Preview salvati in {base_output_dir}")
