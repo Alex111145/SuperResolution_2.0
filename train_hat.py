@@ -11,9 +11,12 @@ from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
 
+# === PATCH TORCHVISION ===
+import torchvision.transforms.functional as TF_functional
+sys.modules['torchvision.transforms.functional_tensor'] = TF_functional
+
 # === IMPORT MODELLO IBRIDO ===
 from models.hybridmodels import HybridHATRealESRGAN
-
 from models.discriminator import UNetDiscriminatorSN
 from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
@@ -135,9 +138,9 @@ def train_worker():
         embed_dim=180,
         depths=(6, 6, 6, 6, 6, 6),
         num_heads=(6, 6, 6, 6, 6, 6),
-        window_size=7,
+        window_size=8,
         upscale=4,
-        num_rrdb=23,  # Real-ESRGAN completo
+        num_rrdb=23,
         num_feat=64,
         num_grow_ch=32
     ).to(device)
@@ -277,4 +280,3 @@ def train_worker():
 
 if __name__ == "__main__":
     train_worker()
-
