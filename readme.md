@@ -1,7 +1,7 @@
 PULIRE CODICEEEEEEEEEEEE
 
 
-SOLO HAT
+SOLO models HAT!!!!!!!!!!!!!!!!!!!!
 
 Riferimento Esplicito: Nel file start.py, l'intestazione dello script stampa a video: "ASTRONOMICAL HAT LAUNCHER (XPixel)".
 
