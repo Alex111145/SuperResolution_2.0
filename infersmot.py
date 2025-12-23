@@ -1,275 +1,180 @@
 import sys
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-import cv2
+import shutil
+import json
 import os
 from pathlib import Path
+from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 from PIL import Image
 from tqdm import tqdm
+from typing import List, Optional, Dict
 
-# --- CONFIGURAZIONE PERCORSI ---
-# Adatta questi percorsi se necessario
 CURRENT_SCRIPT = Path(__file__).resolve()
-PROJECT_ROOT = CURRENT_SCRIPT.parent.parent  # Assumendo che infer.py sia in una sottocartella, altrimenti usa .parent
+PROJECT_ROOT = CURRENT_SCRIPT.parent
+OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+ROOT_DATA_DIR = PROJECT_ROOT / "data"
+
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Percorsi Input/Output e Modello
-INPUT_FOLDER = PROJECT_ROOT / "inputs"       # Metti qui le immagini da elaborare
-OUTPUT_FOLDER = PROJECT_ROOT / "outputs_inf" # Qui verranno salvati i risultati
-MODEL_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "best_model.pth" # Percorso del tuo .pth
+# Assicurati che i file esistano
+from models.architecture import SwinIR
+from dataset.astronomical_dataset import AstronomicalDataset
+from utils.metrics import TrainMetrics
 
-# Assicurati che le cartelle esistano
-OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-if not INPUT_FOLDER.exists():
-    INPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-    print(f"ATTENZIONE: Creata cartella {INPUT_FOLDER}. Inserisci qui le immagini e riavvia.")
-    sys.exit(0)
+torch.backends.cudnn.benchmark = True
 
-# --- IMPORTAZIONI MODULI CUSTOM ---
-try:
-    from src.architecture_train import RRDBNet, HAT_Arch
-    print("Moduli architettura importati.")
-except ImportError as e:
-    print(f"Errore importazione src: {e}")
-    sys.exit(1)
+def save_as_tiff16(tensor, path):
+    """Salva il tensore come immagine TIFF a 16-bit."""
+    arr = tensor.squeeze().float().cpu().numpy()
+    arr = np.clip(arr, 0, 1)
+    arr_u16 = (arr * 65535).astype(np.uint16)
+    Image.fromarray(arr_u16, mode='I;16').save(path)
 
-# --- 1. SELEZIONE DISPOSITIVO ---
-def select_device():
-    print("\n" + "="*30)
-    print("   CONFIGURAZIONE DISPOSITIVO")
-    print("="*30)
-    if not torch.cuda.is_available():
-        print(" [!] Nessuna GPU rilevata. Uso CPU.")
-        return torch.device('cpu')
-
-    print(f" GPU Rilevata: {torch.cuda.get_device_name(0)}")
-    print(" 1. Usa GPU (Veloce)")
-    print(" 2. Usa CPU (Lento ma stabile)")
-    
-    while True:
-        choice = input(" > Scelta (1/2): ").strip()
-        if choice == '1': return torch.device('cuda')
-        elif choice == '2': return torch.device('cpu')
-
-# --- 2. CLASSE MODELLO (WRAPPER) ---
-class DynamicHybridModel(nn.Module):
-    def __init__(self, output_size=512, hat_embed_dim=480, hat_depths=[8]*8): 
-        super().__init__()
-        self.output_size = output_size
-        
-        # Stage 1: RRDBNet
-        self.stage1 = RRDBNet(num_in_ch=1, num_out_ch=1, num_feat=128, num_block=27, scale=2)
-        
-        # Stage 2: HAT (Se disponibile)
-        self.has_hat = False
-        if HAT_Arch:
-            self.stage2 = HAT_Arch(
-                img_size=128, in_chans=1, embed_dim=hat_embed_dim, depths=hat_depths,
-                num_heads=[8]*len(hat_depths), upscale=2
-            )
-            self.has_hat = True
-
-        # Refinement Layers
-        self.refine = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2), 
-            nn.Conv2d(64, 1, kernel_size=3, padding=1)
-        )
-        # Upscaler finale se necessario
-        self.smart_upscale = nn.Sequential(
-            nn.Conv2d(1, 4, 3, 1, 1), nn.PixelShuffle(2), nn.PReLU()
-        )
-
-    def forward(self, x):
-        feat_1 = self.stage1(x)
-        out = feat_1
-        
-        if self.has_hat:
-            hat_out = self.stage2(feat_1)
-            if hat_out.shape[-1] != feat_1.shape[-1]:
-                feat_1_up = F.interpolate(feat_1, size=hat_out.shape[-2:], mode='nearest')
-                out = hat_out + feat_1_up
-            else:
-                out = hat_out + feat_1
-
-        # Gestione dimensioni output (Resize/Smart Upscale)
-        # Nota: In inferenza "tiled", questo potrebbe essere bypassato se gestiamo le tile manualmente,
-        # ma lo lasciamo per coerenza con l'architettura.
-        if out.shape[-1] != self.output_size:
-             # Semplice logica adattiva
-             if out.shape[-1] < self.output_size:
-                 out = F.interpolate(out, size=(self.output_size, self.output_size), mode='bicubic')
-        
-        return self.refine(out) + out
-
-# --- 3. RILEVAMENTO PARAMETRI ---
-def detect_model_params(state_dict):
-    params = {'hat_embed_dim': 480, 'hat_depths': [8, 8, 8, 8, 8, 8, 8, 8]}
-    
-    if 'stage2.conv_first.weight' in state_dict:
-        params['hat_embed_dim'] = state_dict['stage2.conv_first.weight'].shape[0]
-
-    max_idx = -1
-    for k in state_dict.keys():
-        if "stage2.layers." in k:
-            parts = k.split(".")
-            if len(parts) > 2 and parts[2].isdigit():
-                max_idx = max(max_idx, int(parts[2]))
-    
-    if max_idx != -1:
-        detected_len = max_idx + 1
-        if detected_len != len(params['hat_depths']):
-            params['hat_depths'] = [6] * detected_len # Default fallback
-            
-    return params
-
-# --- 4. FUNZIONE CORE: INFERENZA A FINESTRE (TILED) ---
-def predict_tiled(model, img_tensor, tile_size=512, overlap=32, device='cuda'):
+def inference_tta(model, img, device):
     """
-    Esegue l'inferenza dividendo l'immagine in tile per evitare OOM su GPU.
-    img_tensor: [1, 1, H, W] range 0-1
+    Test-Time Augmentation (TTA) per 'smoothing' e riduzione rumore.
+    Esegue l'inferenza su 8 versioni dell'immagine (rotazioni + flip) e ne fa la media.
     """
-    b, c, h, w = img_tensor.shape
-    scale = 2 # Fattore di upscale del modello
-    
-    # Calcolo dimensioni output attese
-    out_h, out_w = h * scale, w * scale
-    
-    # Inizializza canvas output e maschera pesi
-    output = torch.zeros((1, 1, out_h, out_w), device=device)
-    output_mask = torch.zeros((1, 1, out_h, out_w), device=device)
-
-    # Loop sulle tile
-    for y in range(0, h, tile_size - overlap):
-        for x in range(0, w, tile_size - overlap):
-            # Coordinate input
-            y_end = min(y + tile_size, h)
-            x_end = min(x + tile_size, w)
+    output_list = []
+    # 8 combinazioni: 4 rotazioni * 2 flip
+    for rot in [0, 1, 2, 3]:
+        for flip in [False, True]:
+            # 1. Augment
+            img_aug = torch.rot90(img, k=rot, dims=[2, 3])
+            if flip:
+                img_aug = torch.flip(img_aug, dims=[3])
             
-            # Estrai patch input
-            patch = img_tensor[:, :, y:y_end, x:x_end].to(device)
-            
-            # Inferenza sulla patch
+            # 2. Inference
             with torch.no_grad():
-                # Nota: Il modello si aspetta output_size fisso nel __init__, 
-                # ma qui lavoriamo su patch variabili. 
-                # Bypassiamo il resize interno forzando l'architettura a processare la patch pura.
-                # Richiede che il forward del modello sia robusto.
-                
-                # Hack temporaneo: Se il modello ha output fisso hardcoded, 
-                # potrebbe fallire qui se non gestiamo il resize nel forward.
-                # Assumiamo che stage1 e stage2 gestiscano dimensioni arbitrarie (sono CNN).
-                pred_patch = model.stage1(patch)
-                if model.has_hat:
-                    hat_out = model.stage2(pred_patch)
-                    if hat_out.shape != pred_patch.shape:
-                        pred_patch = F.interpolate(pred_patch, size=hat_out.shape[-2:])
-                    pred_patch = hat_out + pred_patch
-                pred_patch = model.refine(pred_patch) + pred_patch
+                out_aug = model(img_aug)
             
-            # Calcolo coordinate output
-            y_out, x_out = y * scale, x * scale
-            h_patch_out, w_patch_out = pred_patch.shape[2], pred_patch.shape[3]
+            # 3. De-augment (inverso)
+            if flip:
+                out_aug = torch.flip(out_aug, dims=[3])
+            out_aug = torch.rot90(out_aug, k=-rot, dims=[2, 3])
             
-            # Inserimento nel canvas (Gestione semplice somma per ora, ideale sarebbe blending)
-            output[:, :, y_out:y_out+h_patch_out, x_out:x_out+w_patch_out] += pred_patch
-            output_mask[:, :, y_out:y_out+h_patch_out, x_out:x_out+w_patch_out] += 1.0
-
-    # Normalizza nelle zone di sovrapposizione
-    output = output / (output_mask + 1e-8)
+            output_list.append(out_aug)
+    
+    # 4. Media delle predizioni (Smoothing)
+    output = torch.stack(output_list, dim=0).mean(dim=0)
     return output
 
-# --- 5. MAIN LOOP ---
-def main():
-    device = select_device()
+def get_available_targets(output_root: Path) -> List[str]:
+    if not output_root.is_dir(): return []
+    return sorted([p.name for p in output_root.iterdir() if p.is_dir()])
+
+def run_test(target_model_folder: str):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    print(f"Modalità SMOOTHING attiva (TTA x8) - L'elaborazione sarà più lenta ma più pulita.")
+
+    OUTPUT_DIR = OUTPUT_ROOT / target_model_folder / "test_results_smooth"
+    CHECKPOINT_DIR = OUTPUT_ROOT / target_model_folder / "checkpoints"
     
-    # 1. Caricamento Pesi
-    if not MODEL_PATH.exists():
-        sys.exit(f"ERRORE: Modello non trovato in {MODEL_PATH}")
+    # Crea la cartella di output
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    print(f"Caricamento checkpoint: {MODEL_PATH.name}...")
-    checkpoint = torch.load(MODEL_PATH, map_location=device)
-    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    checkpoints = list(CHECKPOINT_DIR.glob("best_gan_model.pth"))
+    if not checkpoints:
+        checkpoints = list(CHECKPOINT_DIR.glob("latest_checkpoint.pth"))
     
-    # 2. Rilevamento Parametri e Build Modello
-    model_params = detect_model_params(state_dict)
-    print(f"Parametri rilevati: {model_params}")
+    if not checkpoints:
+        print("Nessun checkpoint trovato.")
+        return
     
-    # Importante: output_size qui è fittizio, useremo tiling
-    model = DynamicHybridModel(output_size=512, **model_params) 
-    
-    # Carica pesi (strict=False per evitare errori su chiavi accessorie)
+    CHECKPOINT_PATH = checkpoints[0]
+    print(f"Loading: {CHECKPOINT_PATH}")
+
+    # --- CONFIGURAZIONE MODELLO ---
+    model = SwinIR(upscale=4, in_chans=1, img_size=128, window_size=8,
+                   img_range=1.0, depths=[6, 6, 6, 6, 6, 6], embed_dim=180, num_heads=[6, 6, 6, 6, 6, 6],
+                   mlp_ratio=2, upsampler='pixelshuffle', resi_connection='1conv').to(device)
+
     try:
-        model.load_state_dict(state_dict, strict=False)
-    except Exception as e:
-        print(f"Warning nel caricamento pesi: {e}")
+        state_dict = torch.load(CHECKPOINT_PATH, map_location=device)
+        if 'net_g' in state_dict: state_dict = state_dict['net_g']
+        elif 'model_state_dict' in state_dict: state_dict = state_dict['model_state_dict']
+            
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            name = k.replace("module.", "") 
+            new_state_dict[name] = v
         
-    model.to(device)
-    model.eval()
-    
-    # 3. Processamento Immagini
-    img_files = list(INPUT_FOLDER.glob("*.tif")) + list(INPUT_FOLDER.glob("*.png")) + list(INPUT_FOLDER.glob("*.jpg"))
-    
-    if not img_files:
-        print(f"Nessuna immagine trovata in {INPUT_FOLDER}")
+        model.load_state_dict(new_state_dict, strict=True)
+        print("Pesi caricati correttamente.")
+    except Exception as e:
+        print(f"Errore caricamento pesi: {e}")
         return
 
-    print(f"\nInizio inferenza su {len(img_files)} immagini...")
-    
-    for img_path in tqdm(img_files):
-        try:
-            # Caricamento Immagine (Monocromatica per astronomia 1ch)
-            # Usa cv2 per supporto 16bit nativo
-            img_np = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
-            
-            if img_np is None:
-                print(f"Errore lettura {img_path.name}")
-                continue
-                
-            # Gestione 16 bit vs 8 bit
-            if img_np.dtype == np.uint16:
-                img_norm = img_np.astype(np.float32) / 65535.0
-            else:
-                img_norm = img_np.astype(np.float32) / 255.0
-            
-            # Se l'immagine è 2D (H, W), aggiungi dimensioni
-            if len(img_norm.shape) == 2:
-                img_tensor = torch.from_numpy(img_norm).unsqueeze(0).unsqueeze(0)
-            elif len(img_norm.shape) == 3:
-                # Converti HWC a CHW e prendi solo 1 canale se RGB
-                img_tensor = torch.from_numpy(img_norm).permute(2, 0, 1).unsqueeze(0)
-                img_tensor = img_tensor[:, 0:1, :, :] # Forza 1 canale
-            
-            # INFERENZA
-            # Se l'immagine è piccola (<1024px) fai inferenza diretta, altrimenti Tiled
-            h, w = img_tensor.shape[2], img_tensor.shape[3]
-            if h < 1024 and w < 1024:
-                img_tensor = img_tensor.to(device)
-                with torch.no_grad():
-                    output = model(img_tensor)
-            else:
-                # Usa la funzione Tiled per immagini grandi
-                output = predict_tiled(model, img_tensor, tile_size=512, overlap=64, device=device)
-            
-            # SALVATAGGIO
-            save_path = OUTPUT_FOLDER / f"{img_path.stem}_SR.tif"
-            
-            # Converti output in numpy uint16
-            out_np = output.squeeze().cpu().clamp(0, 1).numpy()
-            out_u16 = (out_np * 65535).astype(np.uint16)
-            
-            # Salva usando PIL per compatibilità TIFF
-            Image.fromarray(out_u16, mode='I;16').save(save_path)
-            
-        except Exception as e:
-            print(f"Errore su {img_path.name}: {e}")
-            import traceback
-            traceback.print_exc()
+    model.eval()
 
-    print(f"\nFinito! Risultati in: {OUTPUT_FOLDER}")
+    # --- PREPARAZIONE DATASET ---
+    print("\nRicerca dataset di test...")
+    folder_clean = target_model_folder.replace("_DDP_SwinIR", "")
+    targets = folder_clean.split("_")
+    
+    all_test_data = []
+    found_any = False
+
+    for t in targets:
+        test_json_path = ROOT_DATA_DIR / t / "8_dataset_split" / "splits_json" / "test.json"
+        if test_json_path.exists():
+            print(f" -> Trovato test set per {t}: {test_json_path}")
+            with open(test_json_path, 'r') as f:
+                data = json.load(f)
+                all_test_data.extend(data)
+            found_any = True
+        else:
+            print(f" [!] ATTENZIONE: Nessun test.json trovato per {t}")
+
+    if not found_any or not all_test_data:
+        print("Nessun dato di test trovato.")
+        return
+
+    TEMP_JSON = OUTPUT_DIR / "temp_test_combined.json"
+    with open(TEMP_JSON, 'w') as f:
+        json.dump(all_test_data, f)
+
+    test_ds = AstronomicalDataset(TEMP_JSON, base_path=PROJECT_ROOT, augment=False)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+    
+    metrics = TrainMetrics()
+    print(f"Inizio inferenza (con Smoothing TTA) su {len(test_ds)} immagini...\n")
+
+    # --- CICLO DI INFERENZA CON TTA ---
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(test_loader, desc="Processing")):
+            lr = batch['lr'].to(device)
+            hr = batch['hr'].to(device)
+            
+            # Usa la funzione TTA invece della chiamata diretta al modello
+            sr = inference_tta(model, lr, device)
+            
+            # Calcolo Metriche
+            sr_clamped = torch.clamp(sr, 0, 1)
+            metrics.update(sr_clamped, hr)
+            
+            # Salvataggio
+            filename = f"test_{i:04d}_sr_smooth.tiff"
+            save_path = OUTPUT_DIR / filename
+            save_as_tiff16(sr_clamped, save_path)
+
+    avg_psnr = metrics.psnr / metrics.count if metrics.count > 0 else 0
+    
+    print("\n" + "="*40)
+    print(f"TEST COMPLETATO.")
+    print(f"Immagini salvate in: {OUTPUT_DIR}")
+    print(f"Average PSNR: {avg_psnr:.2f} dB")
+    print("="*40)
 
 if __name__ == "__main__":
-    main()
+    targets = get_available_targets(OUTPUT_ROOT)
+    if targets:
+        print("Cartelle trovate:", targets)
+        sel = input("Scrivi nome cartella: ")
+        run_test(sel)
+    else:
+        print("Nessun output trovato.")
