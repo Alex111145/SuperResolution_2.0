@@ -28,7 +28,6 @@ def setup_paths():
 setup_paths()
 
 def import_external_archs():
-    """Tenta di importare solo le architetture effettivamente necessarie."""
     print("Importazione Moduli Esterni...")
     
     RRDBNet = None
@@ -40,5 +39,4 @@ def import_external_archs():
     except ImportError as e:
         print(f"Errore import BasicSR: {e}")
 
-    # HAT è stato rimosso dalla logica di importazione
     return RRDBNet
