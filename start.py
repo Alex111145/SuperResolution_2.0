@@ -4,19 +4,15 @@ import subprocess
 import torch
 from pathlib import Path
 
-# Configurazione percorsi
 CURRENT_SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_SCRIPT_DIR
 DATA_DIR = PROJECT_ROOT / "data"
-# Percorso modificato per puntare al nuovo motore HAT
 SCRIPT_PATH = PROJECT_ROOT / "train_hat.py" 
 
 def clear_screen():
-    """Pulisce la console a seconda del sistema operativo."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def get_available_targets(required_subdir='8_dataset_split'):
-    """Identifica i target disponibili con split JSON pronti."""
     if not DATA_DIR.exists():
         return []
     
@@ -29,7 +25,6 @@ def get_available_targets(required_subdir='8_dataset_split'):
     return sorted(valid_subdirs)
 
 def get_available_gpus():
-    """Rileva le GPU NVIDIA disponibili tramite torch."""
     count = torch.cuda.device_count()
     gpus = []
     for i in range(count):
@@ -39,7 +34,6 @@ def get_available_gpus():
     return gpus
 
 def select_targets_interactive(targets):
-    """Interfaccia utente per la selezione dei target astronomici."""
     print("Target disponibili per il training HAT (con split pronti):")
     for idx, t in enumerate(targets):
         print(f"   [{idx}] {t}")
@@ -70,7 +64,6 @@ def select_targets_interactive(targets):
             print("Formato di input non valido.")
 
 def select_gpus_interactive(gpus):
-    """Interfaccia per la scelta delle GPU da usare in parallelo."""
     print("GPU Disponibili:")
     for g in gpus:
         print(f"   {g}")
@@ -95,7 +88,7 @@ def select_gpus_interactive(gpus):
 def main():
     clear_screen()
     print("==========================================")
-    print("      ASTRONOMICAL HAT LAUNCHER (XPixel)  ")
+    print("      ASTRONOMICAL HAT LAUNCHER           ")
     print("==========================================\n")
 
     if not torch.cuda.is_available():
@@ -116,14 +109,12 @@ def main():
     print(f"\nTarget: {target_env_string}")
     print(f"GPU: {gpu_env_string} (Processi: {nproc})\n")
 
-    # Configurazione ambiente per il training distribuito
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_env_string
     env["NCCL_P2P_DISABLE"] = "1"
     env["NCCL_IB_DISABLE"] = "1"
     env["OMP_NUM_THREADS"] = "4"
 
-    # Comando per il lancio distribuito con HAT
     cmd = [
         sys.executable,
         "-m", "torch.distributed.run",
