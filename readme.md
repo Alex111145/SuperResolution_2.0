@@ -2,18 +2,19 @@ PULIRE CODICEEEEEEEEEEEE
 
 
 HAT E basic 
+cd ~/SuperResolution/models
 
+# Clona il repository HAT ufficiale
+git clone https://github.com/XPixelGroup/HAT.git
 
-# Attiva il venv se non è attivo
+# Verifica la struttura
+ls -la HAT/
+Installazione dei Requisiti HAT
+bash
+cd ~/SuperResolution
+
+# Attiva il virtual environment se non già attivo
 source venv/bin/activate
 
-# Aggiorna pip
-pip install --upgrade pip
-
-# Installa BasicSR e dipendenze
-pip install git+https://github.com/XPixelGroup/BasicSR.git
-pip install einops timm addict
-
-# Fix rapido per il problema torchvision (se persiste dopo l'installazione)
-python fix_basicsr.py
-
+# Installa le dipendenze HAT
+pip install timm einops
