@@ -151,8 +151,14 @@ def train_worker():
 
         # --- SALVATAGGIO CHECKPOINT E PREVIEW ---
         if rank == 0 and epoch % SAVE_INTERVAL == 0:
-            ckpt_dir = Path("./outputs/checkpoints")
-            preview_dir = Path("./outputs/previews")
+            # Sostituisce la virgola con underscore per creare il nome cartella (es. target1_target2)
+            target_folder_name = args.target.replace(',', '_')
+            
+            # Percorsi aggiornati: outputs/NOME_TARGET/checkpoints
+            base_output_dir = Path("./outputs") / target_folder_name
+            ckpt_dir = base_output_dir / "checkpoints"
+            preview_dir = base_output_dir / "previews"
+            
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             preview_dir.mkdir(parents=True, exist_ok=True)
             
@@ -163,7 +169,7 @@ def train_worker():
             # Salva Foto Preview
             save_validation_preview(lr, sr, hr, epoch, preview_dir)
             
-            tqdm.write(f" [SAVE] Epoch {epoch}: Modello e Preview salvati.")
+            tqdm.write(f" [SAVE] Epoch {epoch}: Modello e Preview salvati in {base_output_dir}")
 
     dist.destroy_process_group()
 
