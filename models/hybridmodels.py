@@ -1,12 +1,7 @@
-"""
-Modello Ibrido HAT + Real-ESRGAN per Super-Resolution Astronomica
-"""
-
 import sys
 import os
 from pathlib import Path
 
-# === PATCH TORCHVISION (PRIMA DI TUTTO!) ===
 import torchvision.transforms.functional as TF_functional
 sys.modules['torchvision.transforms.functional_tensor'] = TF_functional
 
@@ -14,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# === SETUP PERCORSI PER HAT ===
 CURRENT_DIR = Path(__file__).resolve().parent
 HAT_ARCH_PATH = CURRENT_DIR / "hat_arch"
 
@@ -24,15 +18,12 @@ if HAT_ARCH_PATH.exists():
 else:
     raise FileNotFoundError(f"Cartella HAT non trovata: {HAT_ARCH_PATH}")
 
-# === IMPORT HAT (dopo patch torchvision) ===
 try:
     from hat_arch import HAT
     print("✓ HAT importato correttamente")
 except ImportError as e:
     raise ImportError(f"Impossibile importare HAT: {e}")
 
-
-# === BLOCCHI RRDB ===
 
 class ResidualDenseBlock(nn.Module):
     def __init__(self, num_feat=64, num_grow_ch=32):
@@ -74,8 +65,6 @@ class RRDBBlock(nn.Module):
         return out * 0.2 + x
 
 
-# === MODELLO IBRIDO ===
-
 class HybridHATRealESRGAN(nn.Module):
     def __init__(
         self,
@@ -95,7 +84,6 @@ class HybridHATRealESRGAN(nn.Module):
         self.upscale = upscale
         self.img_size = img_size
         
-        # HAT configurato per fare upscaling 2x e restituire feature
         self.hat = HAT(
             img_size=img_size,
             in_chans=in_chans,
@@ -103,27 +91,23 @@ class HybridHATRealESRGAN(nn.Module):
             depths=depths,
             num_heads=num_heads,
             window_size=window_size,
-            upscale=2,  # HAT fa 2x upscaling
-            upsampler='pixelshuffle',  # Usa pixelshuffle per upsampling
+            upscale=2,
+            upsampler='pixelshuffle',
             img_range=1.0,
             resi_connection='1conv'
         )
         
-        # Adattatore: da in_chans (output HAT dopo upsampling) a num_feat
         self.conv_adapt = nn.Conv2d(in_chans, num_feat, 3, 1, 1)
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
         
-        # RRDB trunk
         self.rrdb_trunk = nn.Sequential(
             *[RRDBBlock(num_feat, num_grow_ch) for _ in range(num_rrdb)]
         )
         
         self.conv_body = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
         
-        # Upsampling finale 2x (per arrivare a 4x totale)
         self.conv_up = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
         
-        # HR reconstruction
         self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
         self.conv_last = nn.Conv2d(num_feat, in_chans, 3, 1, 1)
         
@@ -138,22 +122,17 @@ class HybridHATRealESRGAN(nn.Module):
                     m.bias.data.zero_()
     
     def forward(self, x):
-        # HAT fa 2x upscaling (128 -> 256)
         hat_out = self.hat(x)
         
-        # Adatta features per RRDB
         feat = self.lrelu(self.conv_adapt(hat_out))
         trunk_feat = feat
         
-        # RRDB processing
         body_feat = self.rrdb_trunk(feat)
         body_feat = self.conv_body(body_feat)
         feat = trunk_feat + body_feat
         
-        # Upsampling finale 2x (256 -> 512)
         feat = self.lrelu(self.conv_up(F.interpolate(feat, scale_factor=2, mode='nearest')))
         
-        # HR reconstruction
         out = self.conv_last(self.lrelu(self.conv_hr(feat)))
         
         return out
