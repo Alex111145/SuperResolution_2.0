@@ -10,6 +10,12 @@ from torch.utils.data import DataLoader, DistributedSampler
 from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
+import warnings
+
+# === PULIZIA WARNINGS ===
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.models._utils")
+warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
+warnings.filterwarnings("ignore", message="torch.meshgrid: in an upcoming release")
 
 # --- FIX IMPORT PRIORITARIO ---
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -51,7 +57,7 @@ def save_validation_preview(lr, sr, hr, epoch, save_path):
 
     # Crea immagine combinata
     combined = np.hstack((lr_img_resized, sr_img, hr_img))
-    Image.fromarray(combined).save(save_path / f"epoch_{epoch}_preview.jpg")
+    Image.fromarray(combined).save(save_path / f"epoch_{epoch:03d}_preview.jpg")
 
 def setup():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -65,9 +71,27 @@ def setup():
         os.environ["MASTER_PORT"] = "29500"
         dist.init_process_group(backend="gloo")
 
+def find_latest_checkpoint(ckpt_dir):
+    """Trova il checkpoint più recente basandosi sul numero di epoca nel nome file"""
+    if not ckpt_dir.exists():
+        return None
+    
+    # Cerca file pattern hat_epoch_XXX.pth
+    pths = list(ckpt_dir.glob("hat_epoch_*.pth"))
+    if not pths:
+        return None
+        
+    try:
+        # Ordina in base al numero estratto dal nome
+        latest = sorted(pths, key=lambda x: int(x.stem.split('_')[-1]))[-1]
+        return latest
+    except Exception:
+        return None
+
 def train_worker():
     parser = argparse.ArgumentParser()
     parser.add_argument('--target', type=str, required=True)
+    parser.add_argument('--resume', type=str, default=None, help='Path checkpoint per resume manuale')
     args, unknown = parser.parse_known_args()
 
     setup()
@@ -75,12 +99,32 @@ def train_worker():
     rank = dist.get_rank()
     device = torch.device(f"cuda:{local_rank}")
 
+    # Configurazione Percorsi Output
+    target_folder_name = args.target.replace(',', '_')
+    base_output_dir = Path("./outputs") / target_folder_name
+    ckpt_dir = base_output_dir / "checkpoints"
+    preview_dir = base_output_dir / "previews"
+
+    if rank == 0:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        preview_dir.mkdir(parents=True, exist_ok=True)
+
+    # === LOGICA AUTO-RESUME ===
+    if args.resume is None:
+        latest_ckpt = find_latest_checkpoint(ckpt_dir)
+        if latest_ckpt:
+            args.resume = str(latest_ckpt)
+            if rank == 0:
+                print(f"🔄 Auto-resume attivato: Trovato {latest_ckpt.name}")
+
     if rank == 0:
         print(f"Avvio su {device}. Target: {args.target}")
+        if args.resume:
+            print(f"Resume da: {args.resume}")
 
     # Dataset Combinato
     targets = args.target.split(',')
-    combined_json_path = "temp_train_combined.json"
+    combined_json_path = f"temp_train_combined_{rank}.json" # Unique per rank
 
     if rank == 0:
         all_pairs = []
@@ -90,11 +134,12 @@ def train_worker():
                 with open(json_path, 'r') as f: all_pairs.extend(json.load(f))
         
         if not all_pairs: sys.exit("Nessun dato trovato.")
-        with open(combined_json_path, 'w') as f: json.dump(all_pairs, f)
+        # Usa un nome file comune per il dataset finale
+        with open("temp_train_combined_HAT.json", 'w') as f: json.dump(all_pairs, f)
 
     dist.barrier()
 
-    train_ds = AstronomicalDataset(combined_json_path, base_path="./")
+    train_ds = AstronomicalDataset("temp_train_combined_HAT.json", base_path="./")
     train_sampler = DistributedSampler(train_ds)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=train_sampler, 
                               num_workers=4, pin_memory=True, persistent_workers=True)
@@ -113,10 +158,33 @@ def train_worker():
     criterion_g = CombinedGANLoss(pixel_weight=1.0, adversarial_weight=0.005).to(device)
     criterion_d = DiscriminatorLoss().to(device)
 
+    # === CARICAMENTO CHECKPOINT (RESUME) ===
+    start_epoch = 1
+    if args.resume:
+        try:
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Gestione compatibilità vecchi checkpoint (solo pesi) vs nuovi (dizionario completo)
+            if 'model_state_dict' in checkpoint:
+                net_g.module.load_state_dict(checkpoint['model_state_dict'])
+                opt_g.load_state_dict(checkpoint['optimizer_state_dict'])
+                # opt_d.load_state_dict(checkpoint['optimizer_d_state_dict']) # Se disponibile
+                start_epoch = checkpoint['epoch'] + 1
+                if rank == 0: print(f"✅ Checkpoint completo caricato. Ripresa da Epoca {start_epoch}")
+            else:
+                # Fallback per vecchi checkpoint che erano solo state_dict
+                net_g.module.load_state_dict(checkpoint)
+                if rank == 0: print("⚠️ Caricati solo pesi modello (vecchio formato). Si riparte da Epoca 1.")
+
+        except Exception as e:
+            if rank == 0: print(f"❌ Errore caricamento resume: {e}")
+
+    dist.barrier()
+
     if rank == 0: 
         print("=== TRAINING AVVIATO ===")
 
-    for epoch in range(1, NUM_EPOCHS + 1):
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
         train_sampler.set_epoch(epoch)
         if rank == 0:
             loader_bar = tqdm(train_loader, desc=f"Ep {epoch}", unit="bt", leave=True)
@@ -151,25 +219,27 @@ def train_worker():
 
         # --- SALVATAGGIO CHECKPOINT E PREVIEW ---
         if rank == 0 and epoch % SAVE_INTERVAL == 0:
-            # Sostituisce la virgola con underscore per creare il nome cartella (es. target1_target2)
-            target_folder_name = args.target.replace(',', '_')
+            # Salva Checkpoint Completo (per resume)
+            checkpoint_dict = {
+                'epoch': epoch,
+                'model_state_dict': net_g.module.state_dict(),
+                'optimizer_state_dict': opt_g.state_dict(),
+                'loss_g': loss_g.item(),
+                'loss_d': loss_d.item()
+            }
             
-            # Percorsi aggiornati: outputs/NOME_TARGET/checkpoints
-            base_output_dir = Path("./outputs") / target_folder_name
-            ckpt_dir = base_output_dir / "checkpoints"
-            preview_dir = base_output_dir / "previews"
-            
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            preview_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Salva Modello
-            torch.save(net_g.module.state_dict(), ckpt_dir / "latest_checkpoint.pth")
-            torch.save(net_g.module.state_dict(), ckpt_dir / "best_gan_model.pth")
+            # Salva versione numerata (storico) e versione 'latest' (per compatibilità)
+            torch.save(checkpoint_dict, ckpt_dir / f"hat_epoch_{epoch:03d}.pth")
+            torch.save(net_g.module.state_dict(), ckpt_dir / "latest_checkpoint.pth") # Legacy format (solo pesi)
+            torch.save(net_g.module.state_dict(), ckpt_dir / "best_gan_model.pth")    # Legacy format
             
             # Salva Foto Preview
             save_validation_preview(lr, sr, hr, epoch, preview_dir)
             
-            tqdm.write(f" [SAVE] Epoch {epoch}: Modello e Preview salvati in {base_output_dir}")
+            tqdm.write(f" [SAVE] Epoch {epoch}: Checkpoint salvato.")
+
+    if rank == 0 and os.path.exists("temp_train_combined_HAT.json"):
+        os.remove("temp_train_combined_HAT.json")
 
     dist.destroy_process_group()
 
