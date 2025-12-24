@@ -10,6 +10,15 @@ from torch.utils.data import DataLoader, DistributedSampler
 from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
+import warnings
+
+# === PULIZIA WARNINGS (Nuovo Blocco) ===
+# Silenzia i warning di Torchvision (pretrained/weights)
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.models._utils")
+# Silenzia il warning sui "Grad strides" di DDP
+warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
+# Silenzia altri warning minori di PyTorch non critici
+warnings.filterwarnings("ignore", message="torch.meshgrid: in an upcoming release")
 
 # === PATCH TORCHVISION ===
 import torchvision.transforms.functional as TF_functional
@@ -26,8 +35,8 @@ BATCH_SIZE = 1
 LR_G = 1e-4
 LR_D = 1e-4
 NUM_EPOCHS = 300
-SAVE_INTERVAL_CKPT = 3   # Checkpoint ogni 3 epoche [Richiesta Utente]
-SAVE_INTERVAL_IMG = 10   # Foto ogni 10 epoche [Richiesta Utente]
+SAVE_INTERVAL_CKPT = 3   # Checkpoint ogni 3 epoche
+SAVE_INTERVAL_IMG = 10   # Foto ogni 10 epoche
 GRADIENT_ACCUMULATION = 2  
 
 def tensor_to_img(tensor):
@@ -62,6 +71,21 @@ def setup_distributed():
         os.environ["MASTER_PORT"] = "29500"
         dist.init_process_group(backend="gloo")
 
+def find_latest_checkpoint(ckpt_dir):
+    """Trova il checkpoint più recente basandosi sul numero di epoca nel nome file"""
+    if not ckpt_dir.exists():
+        return None
+    
+    pths = list(ckpt_dir.glob("hybrid_epoch_*.pth"))
+    if not pths:
+        return None
+        
+    try:
+        latest = sorted(pths, key=lambda x: int(x.stem.split('_')[-1]))[-1]
+        return latest
+    except Exception:
+        return None
+
 def train_worker():
     parser = argparse.ArgumentParser(description='Training Ibrido HAT + Real-ESRGAN')
     parser.add_argument('--target', type=str, required=True,
@@ -69,7 +93,7 @@ def train_worker():
     parser.add_argument('--pretrained_hat', type=str, default=None,
                        help='Path a checkpoint HAT pre-trained (opzionale)')
     parser.add_argument('--resume', type=str, default=None,
-                       help='Path a checkpoint per riprendere training')
+                       help='Path esplicito per riprendere training (opzionale)')
     args, unknown = parser.parse_known_args()
 
     setup_distributed()
@@ -78,7 +102,26 @@ def train_worker():
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
+    target_folder_name = args.target.replace(',', '_')
+    base_output_dir = Path("./outputs") / target_folder_name
+    ckpt_dir = base_output_dir / "checkpoints"
+    preview_dir = base_output_dir / "previews"
+    
     if rank == 0:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        preview_dir.mkdir(parents=True, exist_ok=True)
+
+    # === LOGICA AUTO-RESUME ===
+    if args.resume is None:
+        latest_ckpt = find_latest_checkpoint(ckpt_dir)
+        if latest_ckpt:
+            args.resume = str(latest_ckpt)
+            if rank == 0:
+                print(f"🔄 Auto-resume attivato: Trovato {latest_ckpt.name}")
+
+    if rank == 0:
+        # Pulisce lo schermo per un avvio pulito
+        os.system('cls' if os.name == 'nt' else 'clear')
         print("=" * 70)
         print("🚀 TRAINING MODELLO IBRIDO HAT + REAL-ESRGAN")
         print("=" * 70)
@@ -86,14 +129,14 @@ def train_worker():
         print(f"   • Device: {device}")
         print(f"   • World Size: {world_size}")
         print(f"   • Batch Size (per GPU): {BATCH_SIZE}")
-        print(f"   • Batch Size (effettivo): {BATCH_SIZE * GRADIENT_ACCUMULATION * world_size}")
         print(f"   • Target(s): {args.target}")
+        if args.resume:
+            print(f"   • Ripresa da: {Path(args.resume).name}")
         print("=" * 70)
 
     # === PREPARAZIONE DATASET ===
     targets = args.target.split(',')
-    combined_json_path = "temp_train_combined.json"
-
+    
     if rank == 0:
         all_pairs = []
         for t in targets:
@@ -107,15 +150,16 @@ def train_worker():
                 print(f"   ⚠️  Warning: {json_path} non trovato")
         
         if not all_pairs:
+            if os.path.exists("temp_train_combined.json"): os.remove("temp_train_combined.json")
             sys.exit("❌ Errore: Nessun dato di training trovato!")
         
-        with open(combined_json_path, 'w') as f:
+        with open("temp_train_combined.json", 'w') as f:
             json.dump(all_pairs, f)
         print(f"   📦 Totale training samples: {len(all_pairs)}")
 
     dist.barrier()
 
-    train_ds = AstronomicalDataset(combined_json_path, base_path="./")
+    train_ds = AstronomicalDataset("temp_train_combined.json", base_path="./")
     train_sampler = DistributedSampler(train_ds, shuffle=True)
     train_loader = DataLoader(
         train_ds,
@@ -127,20 +171,21 @@ def train_worker():
         drop_last=True
     )
 
-    # === INIZIALIZZAZIONE MODELLI ===
+    # === INIZIALIZZAZIONE MODELLI (Versione SMALL) ===
     net_g = HybridHATRealESRGAN(
         img_size=128, in_chans=1, embed_dim=90, depths=(6, 6, 6, 6),
         num_heads=(6, 6, 6, 6), window_size=8, upscale=4,
         num_rrdb=12, num_feat=48, num_grow_ch=24
     ).to(device)
 
-    if args.pretrained_hat and rank == 0:
+    if args.pretrained_hat and not args.resume and rank == 0:
         try:
             net_g.load_pretrained_hat(args.pretrained_hat)
         except Exception as e:
             print(f"⚠️  Impossibile caricare HAT pre-trained: {e}")
 
     net_d = UNetDiscriminatorSN(num_in_ch=1, num_feat=64).to(device)
+    
     net_g = DDP(net_g, device_ids=[local_rank], find_unused_parameters=False)
     net_d = DDP(net_d, device_ids=[local_rank])
 
@@ -151,15 +196,20 @@ def train_worker():
     criterion_d = DiscriminatorLoss().to(device)
 
     start_epoch = 1
-    if args.resume and rank == 0:
+    
+    if args.resume:
         try:
             checkpoint = torch.load(args.resume, map_location=device)
             net_g.module.load_state_dict(checkpoint['model_state_dict'])
             opt_g.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
-            print(f"✓ Training ripreso dall'epoca {start_epoch}")
+            if rank == 0:
+                print(f"✅ Checkpoint caricato (Start Epoch: {start_epoch})")
         except Exception as e:
-            print(f"⚠️  Impossibile riprendere training: {e}")
+            if rank == 0:
+                print(f"❌ Errore caricamento checkpoint: {e}")
+    
+    dist.barrier()
 
     # === TRAINING LOOP ===
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
@@ -202,16 +252,7 @@ def train_worker():
             if rank == 0:
                 loader_bar.set_postfix({'L_G': f"{loss_g.item():.4f}", 'L_D': f"{loss_d.item():.4f}"})
 
-        # === LOGICA DI SALVATAGGIO SEPARATA ===
         if rank == 0:
-            target_folder_name = args.target.replace(',', '_')
-            base_output_dir = Path("./outputs") / target_folder_name
-            ckpt_dir = base_output_dir / "checkpoints"
-            preview_dir = base_output_dir / "previews"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            preview_dir.mkdir(parents=True, exist_ok=True)
-
-            # Salvataggio Checkpoint ogni 3 epoche
             if epoch % SAVE_INTERVAL_CKPT == 0:
                 checkpoint = {
                     'epoch': epoch,
@@ -222,14 +263,16 @@ def train_worker():
                 }
                 torch.save(checkpoint, ckpt_dir / f"hybrid_epoch_{epoch:03d}.pth")
                 torch.save(net_g.module.state_dict(), ckpt_dir / "best_hybrid_model.pth")
-                tqdm.write(f"💾 Epoch {epoch}: Checkpoint salvato.")
+                tqdm.write(f"💾 Checkpoint Epoch {epoch} salvato.")
 
-            # Salvataggio Preview ogni 10 epoche
             if epoch % SAVE_INTERVAL_IMG == 0:
                 save_validation_preview(lr, sr, hr, epoch, preview_dir)
-                tqdm.write(f"🖼️  Epoch {epoch}: Preview immagine salvata.")
+                tqdm.write(f"🖼️  Preview Epoch {epoch} salvata.")
 
-    if rank == 0: print("\n✅ TRAINING COMPLETATO!")
+    if rank == 0: 
+        print("\n✅ TRAINING COMPLETATO!")
+        if os.path.exists("temp_train_combined.json"): os.remove("temp_train_combined.json")
+    
     dist.destroy_process_group()
 
 if __name__ == "__main__":
