@@ -4,6 +4,7 @@ import argparse
 import json
 import torch
 import numpy as np
+import csv
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -13,22 +14,18 @@ from tqdm import tqdm
 from PIL import Image
 import warnings
 
-# === PULIZIA WARNINGS ===
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.models._utils")
 warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
 warnings.filterwarnings("ignore", message="torch.meshgrid: in an upcoming release")
 
-# === PATCH TORCHVISION ===
 import torchvision.transforms.functional as TF_functional
 sys.modules['torchvision.transforms.functional_tensor'] = TF_functional
 
-# === IMPORT MODELLO IBRIDO ===
 from models.hybridmodels import HybridHATRealESRGAN
 from models.discriminator import UNetDiscriminatorSN
 from dataset.astronomical_dataset import AstronomicalDataset
 from utils.gan_losses import CombinedGANLoss, DiscriminatorLoss
 
-# === CONFIGURAZIONE TRAINING ===
 BATCH_SIZE = 1 
 LR_G = 1e-4
 LR_D = 1e-4
@@ -36,7 +33,7 @@ NUM_EPOCHS = 300
 WARMUP_EPOCHS = 30       
 SAVE_INTERVAL_CKPT = 3   
 SAVE_INTERVAL_IMG = 10   
-GRADIENT_ACCUMULATION = 16  # Accumulo alto per stabilità
+GRADIENT_ACCUMULATION = 16
 
 def tensor_to_img(tensor):
     img = tensor.cpu().detach().squeeze().float().numpy()
@@ -73,11 +70,7 @@ def find_latest_checkpoint(ckpt_dir):
         return sorted(pths, key=lambda x: int(x.stem.split('_')[-1]))[-1]
     except: return None
 
-# === FUNZIONE UTILITY PER EMA ===
 def update_ema(model_src, model_ema, decay=0.999):
-    """
-    Aggiorna i pesi del modello EMA facendo una media mobile esponenziale.
-    """
     with torch.no_grad():
         for p_src, p_ema in zip(model_src.parameters(), model_ema.parameters()):
             p_ema.data.mul_(decay).add_(p_src.data, alpha=1 - decay)
@@ -98,17 +91,21 @@ def train_worker():
     base_output_dir = Path("./outputs") / target_folder_name
     ckpt_dir = base_output_dir / "checkpoints"
     preview_dir = base_output_dir / "previews"
+    log_path = base_output_dir / "train_log.csv"
     
     if rank == 0:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         preview_dir.mkdir(parents=True, exist_ok=True)
+        
+        if not log_path.exists():
+            with open(log_path, "w", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Epoch", "G_Total", "L1", "G_Adv", "D_Total", "LR"])
 
-    # Auto-Resume
     if args.resume is None:
         latest_ckpt = find_latest_checkpoint(ckpt_dir)
         if latest_ckpt: args.resume = str(latest_ckpt)
 
-    # Dataset
     targets = args.target.split(',')
     if rank == 0:
         all_pairs = []
@@ -127,7 +124,6 @@ def train_worker():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=train_sampler,
                               num_workers=4, pin_memory=True, persistent_workers=True, drop_last=True)
 
-    # === MODELLO PRINCIPALE ===
     net_g = HybridHATRealESRGAN(
         img_size=128, in_chans=1, embed_dim=90, depths=(6, 6, 6, 6),
         num_heads=(6, 6, 6, 6), window_size=8, upscale=4,
@@ -136,7 +132,6 @@ def train_worker():
 
     net_d = UNetDiscriminatorSN(num_in_ch=1, num_feat=64).to(device)
 
-    # === MODELLO EMA ===
     net_g_ema = HybridHATRealESRGAN(
         img_size=128, in_chans=1, embed_dim=90, depths=(6, 6, 6, 6),
         num_heads=(6, 6, 6, 6), window_size=8, upscale=4,
@@ -157,19 +152,14 @@ def train_worker():
 
     start_epoch = 1
     
-    # === GESTIONE RESUME E FIX OPTIMIZER ===
     if args.resume:
         try:
             checkpoint = torch.load(args.resume, map_location=device)
             net_g.module.load_state_dict(checkpoint['model_state_dict'])
             opt_g.load_state_dict(checkpoint['optimizer_state_dict'])
             
-            # --- FIX PER SCHEDULER: Inietta initial_lr ---
             for param_group in opt_g.param_groups:
                 if 'initial_lr' not in param_group: param_group['initial_lr'] = LR_G
-            
-            # Carichiamo stato Optimizer D (non salvato nel vecchio script ma utile re-inizializzarlo)
-            # Nota: se non c'è nel checkpoint, l'AdamW è già fresco.
             
             net_g_ema.load_state_dict(net_g.module.state_dict())
             start_epoch = checkpoint['epoch'] + 1
@@ -179,11 +169,9 @@ def train_worker():
     else:
         net_g_ema.load_state_dict(net_g.module.state_dict())
 
-    # Assicuriamo initial_lr anche per il discriminatore (se resuming non gestito)
     for param_group in opt_d.param_groups:
          if 'initial_lr' not in param_group: param_group['initial_lr'] = LR_D
 
-    # === SCHEDULER ===
     last_epoch_scheduler = start_epoch - 2 if start_epoch > 1 else -1
     scheduler_g = CosineAnnealingLR(opt_g, T_max=NUM_EPOCHS, eta_min=1e-7, last_epoch=last_epoch_scheduler)
     scheduler_d = CosineAnnealingLR(opt_d, T_max=NUM_EPOCHS, eta_min=1e-7, last_epoch=last_epoch_scheduler)
@@ -191,10 +179,11 @@ def train_worker():
     if rank == 0:
         os.system('cls' if os.name == 'nt' else 'clear')
         print("=" * 70)
-        print(f"🚀 TRAINING HYBRID (Scheduler Attivo & EMA)")
+        print(f"🚀 TRAINING HYBRID (Scheduler Attivo & EMA & Logger)")
         print(f"   • Start Epoch: {start_epoch}")
         print(f"   • LR G Attuale: {scheduler_g.get_last_lr()[0]:.2e}")
         print(f"   • Accumulation: {GRADIENT_ACCUMULATION}")
+        print(f"   • Log File: {log_path}")
         print("=" * 70)
 
     dist.barrier()
@@ -212,23 +201,36 @@ def train_worker():
             loader_bar = tqdm(train_loader, desc=desc, unit="bt", ncols=100)
         else:
             loader_bar = train_loader
+        
+        ep_g_total = 0.0
+        ep_l1 = 0.0 
+        ep_g_adv = 0.0
+        ep_d_total = 0.0
+        steps = 0
 
         for i, batch in enumerate(loader_bar):
             lr = batch['lr'].to(device, non_blocking=True)
             hr = batch['hr'].to(device, non_blocking=True)
 
-            # === TRAIN G ===
             for p in net_d.parameters(): p.requires_grad = False
             
             sr = net_g(lr)
             
+            l1_loss = criterion_pixel(sr, hr)
+            l1_val = l1_loss.item()
+            
+            g_adv_val = 0.0
+            loss_d_val = 0.0
+            
             if is_warmup:
-                loss_g = criterion_pixel(sr, hr)
+                loss_g = l1_loss
                 loss_d = torch.tensor(0.0).to(device)
             else:
                 pred_fake = net_d(sr)
                 pred_real = net_d(hr).detach()
-                loss_g, _ = criterion_gan(sr, hr, pred_real, pred_fake)
+                
+                loss_g, loss_dict_g = criterion_gan(sr, hr, pred_real, pred_fake)
+                g_adv_val = loss_dict_g.get('adversarial', torch.tensor(0.0)).item()
             
             (loss_g / GRADIENT_ACCUMULATION).backward()
 
@@ -237,7 +239,6 @@ def train_worker():
                 opt_g.zero_grad()
                 update_ema(net_g.module, net_g_ema)
 
-            # === TRAIN D ===
             if not is_warmup:
                 for p in net_d.parameters(): p.requires_grad = True
                 
@@ -245,19 +246,49 @@ def train_worker():
                 pred_real_d = net_d(hr)
                 
                 loss_d, _ = criterion_d(pred_real_d, pred_fake_d)
+                loss_d_val = loss_d.item()
+                
                 (loss_d / GRADIENT_ACCUMULATION).backward()
 
                 if (i + 1) % GRADIENT_ACCUMULATION == 0:
                     opt_d.step()
                     opt_d.zero_grad()
             
+            steps += 1
+            ep_g_total += loss_g.item()
+            ep_l1 += l1_val
+            ep_g_adv += g_adv_val
+            ep_d_total += loss_d_val
+
             if rank == 0:
-                loader_bar.set_postfix({'LG': f"{loss_g.item():.3f}", 'LD': f"{loss_d.item():.3f}", 'LR': f"{current_lr:.1e}"})
+                loader_bar.set_postfix({
+                    'LG': f"{loss_g.item():.3f}", 
+                    'L1': f"{l1_val:.3f}", 
+                    'Adv': f"{g_adv_val:.3f}",
+                    'LD': f"{loss_d_val:.3f}", 
+                    'LR': f"{current_lr:.1e}"
+                })
 
         scheduler_g.step()
         scheduler_d.step()
 
         if rank == 0:
+            avg_g = ep_g_total / steps if steps > 0 else 0
+            avg_l1 = ep_l1 / steps if steps > 0 else 0
+            avg_adv = ep_g_adv / steps if steps > 0 else 0
+            avg_d = ep_d_total / steps if steps > 0 else 0
+
+            with open(log_path, "a", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    epoch, 
+                    f"{avg_g:.4f}", 
+                    f"{avg_l1:.4f}", 
+                    f"{avg_adv:.4f}", 
+                    f"{avg_d:.4f}", 
+                    f"{current_lr:.2e}"
+                ])
+
             if epoch % SAVE_INTERVAL_CKPT == 0 or epoch == NUM_EPOCHS:
                 checkpoint = {
                     'epoch': epoch,
