@@ -1,4 +1,8 @@
 NOVITA SCHEDULER
+log con tutti le metriche 
+
+
+
 
 OGGETTI CHIAVE
 
