@@ -36,8 +36,7 @@ NUM_EPOCHS = 300
 WARMUP_EPOCHS = 30       
 SAVE_INTERVAL_CKPT = 3   
 SAVE_INTERVAL_IMG = 10   
-# AUMENTATO A 16 PER STABILIZZARE I GRADIENTI (Simula Batch Size 16)
-GRADIENT_ACCUMULATION = 16  
+GRADIENT_ACCUMULATION = 16  # Accumulo alto per stabilità
 
 def tensor_to_img(tensor):
     img = tensor.cpu().detach().squeeze().float().numpy()
@@ -137,13 +136,12 @@ def train_worker():
 
     net_d = UNetDiscriminatorSN(num_in_ch=1, num_feat=64).to(device)
 
-    # === MODELLO EMA (Copia statica per inferenza pulita) ===
+    # === MODELLO EMA ===
     net_g_ema = HybridHATRealESRGAN(
         img_size=128, in_chans=1, embed_dim=90, depths=(6, 6, 6, 6),
         num_heads=(6, 6, 6, 6), window_size=8, upscale=4,
         num_rrdb=12, num_feat=48, num_grow_ch=24
     ).to(device)
-    # Disabilita gradiente per EMA
     for p in net_g_ema.parameters():
         p.requires_grad = False
 
@@ -153,38 +151,40 @@ def train_worker():
     opt_g = torch.optim.AdamW(net_g.parameters(), lr=LR_G, betas=(0.9, 0.99))
     opt_d = torch.optim.AdamW(net_d.parameters(), lr=LR_D, betas=(0.9, 0.99))
 
-    # LOSSES
     criterion_pixel = torch.nn.L1Loss().to(device) 
     criterion_gan = CombinedGANLoss(pixel_weight=1.0, adversarial_weight=0.005).to(device)
     criterion_d = DiscriminatorLoss().to(device)
 
     start_epoch = 1
     
-    # === GESTIONE RESUME ===
+    # === GESTIONE RESUME E FIX OPTIMIZER ===
     if args.resume:
         try:
             checkpoint = torch.load(args.resume, map_location=device)
             net_g.module.load_state_dict(checkpoint['model_state_dict'])
             opt_g.load_state_dict(checkpoint['optimizer_state_dict'])
             
-            # Inizializza EMA con i pesi caricati (se non esiste un checkpoint EMA specifico, partiamo da qui)
-            net_g_ema.load_state_dict(net_g.module.state_dict())
+            # --- FIX PER SCHEDULER: Inietta initial_lr ---
+            for param_group in opt_g.param_groups:
+                if 'initial_lr' not in param_group: param_group['initial_lr'] = LR_G
             
+            # Carichiamo stato Optimizer D (non salvato nel vecchio script ma utile re-inizializzarlo)
+            # Nota: se non c'è nel checkpoint, l'AdamW è già fresco.
+            
+            net_g_ema.load_state_dict(net_g.module.state_dict())
             start_epoch = checkpoint['epoch'] + 1
-            if rank == 0: 
-                print(f"✅ Resume da epoca {start_epoch}")
+            if rank == 0: print(f"✅ Resume da epoca {start_epoch}")
         except Exception as e:
             if rank == 0: print(f"❌ Errore resume: {e}")
     else:
-        # Se è un nuovo training, EMA parte uguale al modello iniziale
         net_g_ema.load_state_dict(net_g.module.state_dict())
 
-    # === SCHEDULER (Inizializzato ORA con gestione Resume) ===
-    # last_epoch=start_epoch-2 serve per dire allo scheduler dove siamo arrivati.
-    # (es. se start_epoch=81, last_epoch=79, così il prossimo step è l'80esimo della curva)
-    # Se start_epoch=1, last_epoch=-1 (default)
+    # Assicuriamo initial_lr anche per il discriminatore (se resuming non gestito)
+    for param_group in opt_d.param_groups:
+         if 'initial_lr' not in param_group: param_group['initial_lr'] = LR_D
+
+    # === SCHEDULER ===
     last_epoch_scheduler = start_epoch - 2 if start_epoch > 1 else -1
-    
     scheduler_g = CosineAnnealingLR(opt_g, T_max=NUM_EPOCHS, eta_min=1e-7, last_epoch=last_epoch_scheduler)
     scheduler_d = CosineAnnealingLR(opt_d, T_max=NUM_EPOCHS, eta_min=1e-7, last_epoch=last_epoch_scheduler)
 
@@ -193,8 +193,8 @@ def train_worker():
         print("=" * 70)
         print(f"🚀 TRAINING HYBRID (Scheduler Attivo & EMA)")
         print(f"   • Start Epoch: {start_epoch}")
-        print(f"   • LR Iniziale G: {scheduler_g.get_last_lr()[0]:.2e}")
-        print(f"   • Gradient Accumulation: {GRADIENT_ACCUMULATION}")
+        print(f"   • LR G Attuale: {scheduler_g.get_last_lr()[0]:.2e}")
+        print(f"   • Accumulation: {GRADIENT_ACCUMULATION}")
         print("=" * 70)
 
     dist.barrier()
@@ -205,9 +205,7 @@ def train_worker():
         net_d.train()
         
         is_warmup = epoch <= WARMUP_EPOCHS
-        desc = f"Epoch {epoch} [WARMUP]" if is_warmup else f"Ep {epoch} [GAN]"
-        
-        # Recupera LR corrente per barra
+        desc = f"Ep {epoch} [WARMUP]" if is_warmup else f"Ep {epoch} [GAN]"
         current_lr = scheduler_g.get_last_lr()[0]
 
         if rank == 0:
@@ -219,7 +217,7 @@ def train_worker():
             lr = batch['lr'].to(device, non_blocking=True)
             hr = batch['hr'].to(device, non_blocking=True)
 
-            # === TRAINING GENERATOR ===
+            # === TRAIN G ===
             for p in net_d.parameters(): p.requires_grad = False
             
             sr = net_g(lr)
@@ -237,16 +235,9 @@ def train_worker():
             if (i + 1) % GRADIENT_ACCUMULATION == 0:
                 opt_g.step()
                 opt_g.zero_grad()
-                
-                # UPDATE EMA (Solo quando l'optimizer fa lo step)
-                if rank == 0: # EMA solitamente si tiene sul master o su tutti, qui replichiamo logica master
-                    pass # DDP sincronizza i pesi, ma EMA locale va aggiornato
-                
-                # Aggiorniamo EMA su tutti i rank per coerenza, o solo su master. 
-                # Facciamolo su tutti per semplicità, tanto è leggero.
                 update_ema(net_g.module, net_g_ema)
 
-            # === TRAINING DISCRIMINATOR ===
+            # === TRAIN D ===
             if not is_warmup:
                 for p in net_d.parameters(): p.requires_grad = True
                 
@@ -261,13 +252,8 @@ def train_worker():
                     opt_d.zero_grad()
             
             if rank == 0:
-                loader_bar.set_postfix({
-                    'LG': f"{loss_g.item():.3f}", 
-                    'LD': f"{loss_d.item():.3f}",
-                    'LR': f"{current_lr:.1e}"
-                })
+                loader_bar.set_postfix({'LG': f"{loss_g.item():.3f}", 'LD': f"{loss_d.item():.3f}", 'LR': f"{current_lr:.1e}"})
 
-        # === STEP SCHEDULER A FINE EPOCA ===
         scheduler_g.step()
         scheduler_d.step()
 
@@ -279,18 +265,11 @@ def train_worker():
                     'optimizer_state_dict': opt_g.state_dict(),
                 }
                 torch.save(checkpoint, ckpt_dir / f"hybrid_epoch_{epoch:03d}.pth")
-                
-                # Salva BEST Model standard
                 torch.save(net_g.module.state_dict(), ckpt_dir / "best_hybrid_model.pth")
-                
-                # Salva BEST Model EMA (Quello "Magico" per inferenza pulita)
                 torch.save(net_g_ema.state_dict(), ckpt_dir / "best_hybrid_model_EMA.pth")
-                
                 tqdm.write(f"💾 Checkpoint e EMA salvati.")
 
             if epoch % SAVE_INTERVAL_IMG == 0:
-                # Usa EMA per la preview se possibile, altrimenti standard
-                # Qui usiamo standard per vedere cosa "pensa" il training
                 save_validation_preview(lr, sr, hr, epoch, preview_dir)
 
     if rank == 0: 
